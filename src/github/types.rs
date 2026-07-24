@@ -16,12 +16,30 @@ use octocrab::models::workflows::Run;
 /// A snapshot of the authenticated **core** rate-limit budget.
 ///
 /// Authenticated REST gives 5000 requests/hour; this is how much of that is
-/// left. Read once at connect time now; from the poll's response headers later,
-/// to drive the backoff and the header readout (CLAUDE.md rule 3).
+/// left. Read at connect time and refreshed from every poll's `X-RateLimit-*`
+/// response headers, to drive the backoff and the readout (CLAUDE.md rule 3).
 #[derive(Debug, Clone, Copy)]
 pub struct RateLimit {
     pub remaining: u64,
     pub limit: u64,
+    /// When the window resets. `None` if the header was missing/unparseable.
+    pub reset: Option<DateTime<Utc>>,
+}
+
+impl RateLimit {
+    /// Whole minutes until the limit resets — 0 if it's already past or unknown.
+    /// For the "resets in N min" readout.
+    pub fn resets_in_minutes(&self) -> i64 {
+        self.reset
+            .map(|reset| (reset - Utc::now()).num_minutes().max(0))
+            .unwrap_or(0)
+    }
+
+    /// Whether the budget is fully spent and the window hasn't reset yet — the
+    /// signal to pause polling rather than earn a 403.
+    pub fn is_exhausted(&self) -> bool {
+        self.remaining == 0 && self.reset.is_some_and(|reset| reset > Utc::now())
+    }
 }
 
 /// A repository we can watch. octocrab's `Repository` — a swamp of optionals — is
