@@ -11,7 +11,7 @@ use http::header::ACCEPT;
 use octocrab::Octocrab;
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::github::types::{RateLimit, Repo};
+use crate::github::types::{RateLimit, Repo, WorkflowRun};
 
 /// The OAuth App's **public** client id. Device flow needs no secret, and every
 /// device-flow client ships its id in the binary (gh's is public too), so
@@ -133,6 +133,51 @@ pub async fn list_repos(octocrab: &Octocrab) -> Result<Vec<Repo>, ConnectError> 
         .map_err(diagnose)?;
     let all = octocrab.all_pages(first).await.map_err(diagnose)?;
     Ok(all.into_iter().filter_map(Repo::from_model).collect())
+}
+
+/// List recent workflow runs across the watched repos, newest first.
+///
+/// One request per repo (ETag conditional requests will make idle ones free —
+/// that's M2). A single repo failing — deleted, renamed, access revoked — is
+/// logged and skipped rather than sinking the whole poll; but if *every* repo
+/// fails (the offline / bad-token case) that's surfaced, so the UI never renders
+/// an empty, healthy-looking list against a dead connection (CLAUDE.md rule 2).
+pub async fn list_runs(octocrab: &Octocrab, repos: &[String]) -> Result<Vec<WorkflowRun>, String> {
+    let mut runs = Vec::new();
+    let mut failures = 0;
+    let mut last_error = String::new();
+
+    for repo in repos {
+        let Some((owner, name)) = repo.split_once('/') else {
+            continue;
+        };
+        match octocrab
+            .workflows(owner, name)
+            .list_all_runs()
+            .per_page(20)
+            .send()
+            .await
+        {
+            Ok(page) => runs.extend(
+                page.items
+                    .into_iter()
+                    .map(|run| WorkflowRun::from_model(run, repo.clone())),
+            ),
+            Err(err) => {
+                failures += 1;
+                last_error = diagnose(err).message().to_owned();
+                tracing::warn!(repo = %repo, "couldn't list runs: {last_error}");
+            }
+        }
+    }
+
+    if !repos.is_empty() && failures == repos.len() {
+        return Err(last_error);
+    }
+
+    // Newest first: the list reads top-down like an activity feed.
+    runs.sort_by_key(|run| std::cmp::Reverse(run.created_at));
+    Ok(runs)
 }
 
 /// Step 1 of the device flow: ask GitHub for a user code. The returned
