@@ -25,6 +25,8 @@ fn main() {
     // So there's deliberately no adw init here.
     let app = RelmApp::new(APP_ID);
     setup_icon();
+    // Install the app's CSS (the GitHub-brand sign-in button) once GTK is up.
+    app::install_css();
 
     // Load persisted settings and apply the theme before the window is shown, so
     // there's no flash of the wrong colour scheme. The model owns them from here.

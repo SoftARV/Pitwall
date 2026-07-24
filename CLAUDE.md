@@ -285,9 +285,11 @@ This is Redux with a compiler: actions in, one reducer, view derived from state.
   independent) — but **fetched, not streamed** (REST has no follow; completed
   jobs only). Show a spinner while fetching; offer "Open in browser" for a
   running job whose logs aren't downloadable yet.
-- **First run / not signed in**: an `adw::StatusPage` with a "Sign in with GitHub"
-  button → the device-flow screen (user code + browser authorisation). **No
-  watched repos**: a StatusPage inviting
+- **First run / not signed in**: a **blocking onboarding modal** (`adw::Dialog`,
+  non-closable) — an app intro + a GitHub-coloured "Sign in with GitHub" button →
+  the device-flow user code + browser authorisation; it closes onto the app once
+  connected. The **Sign Out** menu item is `hidden-when="action-disabled"`, so it
+  shows only while signed in. **No watched repos**: a StatusPage inviting
   "Add repositories" → the repo picker. Empty / no-results / disconnected /
   rate-limited: distinct `adw::StatusPage`s. Errors: `adw::ToastOverlay`.
 - **Use libadwaita widgets, not raw GTK.** `adw::ActionRow`, `adw::PreferencesGroup`,

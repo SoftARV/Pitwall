@@ -8,45 +8,55 @@
 //! inline — every keyring and GitHub call is dispatched as a relm4 `Command` so
 //! the GTK main thread never blocks (CLAUDE.md rules 4 and 5).
 //!
-//! This milestone (M1, PR 1) is the auth slice: cold start reconnects from a
-//! saved OAuth token in the keyring, or shows "Sign in with GitHub" → the OAuth
-//! **device flow** (a user code + browser authorisation, no client secret) →
-//! store the token → verified `Ready`. The repo picker and run list build on top
-//! of the `Ready` state this ends at.
+//! This milestone (M1, PR 1) is the auth slice. Sign-in is the OAuth **device
+//! flow**, presented in a **blocking onboarding modal** so the app can't be used
+//! until you're connected: a first-run intro → "Sign in with GitHub" → a user
+//! code + browser authorisation → the modal closes onto the app. A saved token
+//! in the keyring reconnects silently at startup, skipping the modal entirely.
 
 use futures_util::FutureExt;
 use relm4::actions::{AccelsPlus, RelmAction, RelmActionGroup};
 use relm4::adw::prelude::*;
 use relm4::gtk::gio;
-use relm4::{Component, ComponentParts, ComponentSender, adw, gtk};
+use relm4::{Component, ComponentParts, ComponentSender, RelmWidgetExt, adw, gtk};
 
 use crate::github::client::{self, ConnectError, Connection};
 use crate::secret;
 use crate::settings::Settings;
 
 // The primary menu's action group. GTK menu items invoke `GAction`s by name;
-// this defines the "win" group and the stateless actions in it (fully qualified,
-// e.g. `win.about`). The group is registered on the window in `init`, where each
+// this defines the "win" group and its stateless actions (fully qualified, e.g.
+// `win.about`). The group is registered on the window in `init`, where each
 // action bridges to an `AppMsg` (except Quit, which acts directly).
 relm4::new_action_group!(AppMenuActionGroup, "win");
 relm4::new_stateless_action!(SignOutAction, AppMenuActionGroup, "sign-out");
 relm4::new_stateless_action!(AboutAction, AppMenuActionGroup, "about");
 relm4::new_stateless_action!(QuitAction, AppMenuActionGroup, "quit");
 
-/// The screen the app is showing. One `gtk::Stack` page each.
+// The one bit of custom CSS: a black "Sign in with GitHub" button, so it's
+// instantly recognisable and stands out on the modal (the earlier grey blended
+// in). Deliberately theme-*in*dependent — black with white text in both light and
+// dark mode — so it's a fixed colour, not an Adwaita named one. The hover/active
+// shades lighten for press feedback. Installed once from `main` (CLAUDE.md: CSS
+// lives with the code that uses it).
+const CSS: &str = "
+.github-button { background-color: #000000; color: #ffffff; }
+.github-button:hover { background-color: #2c2c2c; }
+.github-button:active { background-color: #444444; }
+";
+
+/// Install the app's CSS. Called from `main` once GTK is up.
+pub fn install_css() {
+    relm4::set_global_css(CSS);
+}
+
+/// The screen the main window shows (behind the onboarding modal, when that's up).
 #[derive(Debug)]
 pub enum ViewState {
-    /// Verifying a saved token at startup (or briefly, just after "Sign in"
-    /// before the device code arrives).
+    /// Verifying a saved token at startup.
     Loading,
-    /// No usable token — show the "Sign in with GitHub" screen.
-    NeedsAuth,
-    /// The device flow is live: show the user code and wait for the browser
-    /// authorisation.
-    AwaitingAuth {
-        user_code: String,
-        verification_uri: String,
-    },
+    /// Not signed in — the onboarding modal is presented over a neutral backdrop.
+    SignedOut,
     /// Connected and verified. The repo picker / run list land here next.
     Ready,
     /// Couldn't connect for a non-auth reason (offline, 403, …). Carries the
@@ -54,31 +64,52 @@ pub enum ViewState {
     Disconnected(String),
 }
 
+/// Handles to the onboarding modal, driven imperatively. The modal isn't part of
+/// the window's widget tree — it's *presented* over it — so `#[watch]` can't
+/// reach it; we hold the pieces we need to update (the stack page and the code)
+/// and mutate them from the reducer, the same imperative-handle escape hatch
+/// Dockyard uses for `nav` / `toast_overlay`. Built fresh each time we need to
+/// sign in, dropped on success.
+struct Onboarding {
+    dialog: adw::Dialog,
+    stack: gtk::Stack,
+    code_label: gtk::Label,
+    toast_overlay: adw::ToastOverlay,
+}
+
 pub struct AppModel {
-    /// The live, verified connection, or `None` when not connected. Holds the
-    /// octocrab client every future request goes through.
     connection: Option<Connection>,
     state: ViewState,
-    /// Held so `update` can raise toasts. A refcounted GTK handle, not shared
-    /// model state — cloning it is a pointer bump; it's the standard relm4
-    /// escape hatch for a widget that's commanded rather than declared.
+    /// The current device-flow (user_code, verification_uri), for the copy/open
+    /// buttons. `Some` only while a sign-in is in flight.
+    device: Option<(String, String)>,
+    /// Bumped on every sign-in and every cancel, and stamped onto each device
+    /// command. A result whose generation no longer matches is from a flow the
+    /// user has since cancelled or superseded, so it's ignored — this is what
+    /// keeps an orphaned poll from knocking us out of a good state.
+    auth_gen: u64,
     toast_overlay: adw::ToastOverlay,
-    /// Persisted global settings. Loaded before the app ran and handed in.
+    /// The onboarding modal, while it's shown.
+    onboarding: Option<Onboarding>,
+    /// The "Sign Out" menu action. Disabled unless signed in — and the menu item
+    /// is `hidden-when="action-disabled"`, so disabling it *hides* it (rather
+    /// than greying it), which is what "only show Sign Out when signed in" needs.
+    signout_action: gio::SimpleAction,
     #[allow(dead_code)]
     settings: Settings,
 }
 
 #[derive(Debug, Clone)]
 pub enum AppMsg {
-    /// "Sign in with GitHub" — start the device flow.
+    /// "Sign in with GitHub" (from the onboarding modal) — start the device flow.
     SignIn,
     /// Re-open github.com/login/device in the browser.
     OpenVerification,
     /// Copy the current user code to the clipboard.
     CopyCode,
-    /// Abandon the in-progress sign-in and return to the start screen.
+    /// Abandon the in-progress sign-in and return to the intro.
     CancelAuth,
-    /// "Sign Out" — forget the token and return to the sign-in screen.
+    /// "Sign Out" — forget the token and return to onboarding.
     SignOut,
     /// "Try Again" on the disconnected page — re-run the startup connect.
     Retry,
@@ -87,8 +118,8 @@ pub enum AppMsg {
 }
 
 /// Results coming back from commands — off-thread work landing on the main
-/// thread. Separate from `AppMsg` because relm4 gives commands their own
-/// channel (this is the `CommandOutput` associated type).
+/// thread. Separate from `AppMsg` because relm4 gives commands their own channel
+/// (this is the `CommandOutput` associated type).
 #[derive(Debug)]
 pub enum CommandMsg {
     /// The startup connect finished (saved token from the keyring).
@@ -99,25 +130,24 @@ pub enum CommandMsg {
     TokenCleared,
     /// Device flow step 1: GitHub returned a user code to show.
     DeviceCode {
+        generation: u64,
         user_code: String,
         verification_uri: String,
     },
     /// Device flow finished: authorised (and verified) or failed.
-    DeviceResult(Box<Result<Connection, ConnectError>>),
+    DeviceResult {
+        generation: u64,
+        result: Box<Result<Connection, ConnectError>>,
+    },
 }
 
 impl AppModel {
-    fn toast(&self, message: &str) {
-        self.toast_overlay.add_toast(adw::Toast::new(message));
-    }
-
-    /// Which `Stack` page to show for the current state.
+    /// Which main-window `Stack` page to show for the current state.
     fn state_page(&self) -> &'static str {
         match self.state {
             ViewState::Loading => "loading",
-            ViewState::NeedsAuth => "needs-auth",
-            ViewState::AwaitingAuth { .. } => "awaiting-auth",
-            ViewState::Ready => "ready",
+            ViewState::SignedOut => "welcome",
+            ViewState::Ready => "app",
             ViewState::Disconnected(_) => "disconnected",
         }
     }
@@ -131,7 +161,7 @@ impl AppModel {
         }
     }
 
-    /// The "Ready" page's description: the login plus the remaining rate budget.
+    /// The "app" page's description: the login plus the remaining rate budget.
     fn ready_description(&self) -> String {
         match &self.connection {
             Some(connection) => format!(
@@ -139,14 +169,6 @@ impl AppModel {
                 connection.login, connection.rate.remaining, connection.rate.limit,
             ),
             None => String::new(),
-        }
-    }
-
-    /// The user code to display while awaiting authorisation.
-    fn device_user_code(&self) -> String {
-        match &self.state {
-            ViewState::AwaitingAuth { user_code, .. } => user_code.clone(),
-            _ => String::new(),
         }
     }
 
@@ -161,9 +183,161 @@ impl AppModel {
     /// Open a URL in the user's browser. `gtk::UriLauncher` is the modern,
     /// non-deprecated way (the old `gtk::show_uri` is deprecated and would fail
     /// `clippy -D warnings`). The callback is required but there's nothing to do
-    /// with the result — opening a browser either works or the user notices.
+    /// with the result.
     fn open_uri(uri: &str, root: &adw::ApplicationWindow) {
         gtk::UriLauncher::new(uri).launch(Some(root), gio::Cancellable::NONE, |_result| {});
+    }
+
+    /// Build the onboarding modal: an `adw::Dialog` (non-closable, so it blocks
+    /// the app until sign-in) wrapping a two-page stack — the intro and the
+    /// waiting-for-authorisation page. Buttons post `AppMsg`s so the flow still
+    /// runs through the one reducer.
+    fn build_onboarding(sender: &ComponentSender<Self>) -> Onboarding {
+        // A click-to-message helper, so each button is one line.
+        let bridge = |msg: AppMsg| {
+            let input = sender.input_sender().clone();
+            move |_: &gtk::Button| {
+                input.send(msg.clone()).ok();
+            }
+        };
+
+        // --- Intro page ---
+        let intro = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        intro.set_valign(gtk::Align::Center);
+        intro.set_halign(gtk::Align::Center);
+        intro.set_margin_all(36);
+
+        let icon = gtk::Image::from_icon_name(crate::APP_ID);
+        icon.set_pixel_size(96);
+        intro.append(&icon);
+
+        let title = gtk::Label::new(Some("Welcome to Pitwall"));
+        title.add_css_class("title-1");
+        intro.append(&title);
+
+        let desc = gtk::Label::new(Some(
+            "Keep an eye on your GitHub Actions. Pitwall watches your repositories’ \
+             workflow runs and lets you know the moment one fails — a native GNOME \
+             monitor for your CI.",
+        ));
+        desc.set_wrap(true);
+        desc.set_justify(gtk::Justification::Center);
+        desc.set_max_width_chars(38);
+        desc.add_css_class("dim-label");
+        intro.append(&desc);
+
+        let signin = gtk::Button::with_label("Sign in with GitHub");
+        signin.set_halign(gtk::Align::Center);
+        signin.set_margin_top(12);
+        signin.add_css_class("github-button");
+        signin.add_css_class("pill");
+        signin.connect_clicked(bridge(AppMsg::SignIn));
+        intro.append(&signin);
+
+        // --- Awaiting-authorisation page ---
+        let awaiting = gtk::Box::new(gtk::Orientation::Vertical, 18);
+        awaiting.set_valign(gtk::Align::Center);
+        awaiting.set_halign(gtk::Align::Center);
+        awaiting.set_margin_all(36);
+
+        let a_title = gtk::Label::new(Some("Authorize Pitwall"));
+        a_title.add_css_class("title-2");
+        awaiting.append(&a_title);
+
+        let a_desc = gtk::Label::new(Some(
+            "Enter this code at github.com/login/device — we opened it in your browser.",
+        ));
+        a_desc.set_wrap(true);
+        a_desc.set_justify(gtk::Justification::Center);
+        a_desc.set_max_width_chars(38);
+        a_desc.add_css_class("dim-label");
+        awaiting.append(&a_desc);
+
+        let code_label = gtk::Label::new(None);
+        code_label.add_css_class("title-1");
+        code_label.add_css_class("numeric");
+        code_label.set_selectable(true);
+        awaiting.append(&code_label);
+
+        let code_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        code_buttons.set_halign(gtk::Align::Center);
+        let open = gtk::Button::with_label("Open GitHub");
+        open.add_css_class("pill");
+        open.connect_clicked(bridge(AppMsg::OpenVerification));
+        let copy = gtk::Button::with_label("Copy Code");
+        copy.add_css_class("pill");
+        copy.connect_clicked(bridge(AppMsg::CopyCode));
+        code_buttons.append(&open);
+        code_buttons.append(&copy);
+        awaiting.append(&code_buttons);
+
+        let waiting = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        waiting.set_halign(gtk::Align::Center);
+        let spinner = gtk::Spinner::new();
+        spinner.set_spinning(true);
+        waiting.append(&spinner);
+        let waiting_label = gtk::Label::new(Some("Waiting for authorization…"));
+        waiting_label.add_css_class("dim-label");
+        waiting.append(&waiting_label);
+        awaiting.append(&waiting);
+
+        let cancel = gtk::Button::with_label("Cancel");
+        cancel.set_halign(gtk::Align::Center);
+        cancel.add_css_class("flat");
+        cancel.connect_clicked(bridge(AppMsg::CancelAuth));
+        awaiting.append(&cancel);
+
+        // --- Stack + dialog ---
+        let stack = gtk::Stack::new();
+        stack.add_named(&intro, Some("intro"));
+        stack.add_named(&awaiting, Some("awaiting"));
+        stack.set_visible_child_name("intro");
+
+        let toast_overlay = adw::ToastOverlay::new();
+        toast_overlay.set_child(Some(&stack));
+
+        let dialog = adw::Dialog::new();
+        // Can't be dismissed: no close button, Escape does nothing — you sign in
+        // or you quit the app. `force_close` (on success) overrides this.
+        dialog.set_can_close(false);
+        dialog.set_content_width(400);
+        dialog.set_child(Some(&toast_overlay));
+
+        Onboarding {
+            dialog,
+            stack,
+            code_label,
+            toast_overlay,
+        }
+    }
+
+    /// Present the onboarding modal (building it if needed) and mark us signed
+    /// out. Idempotent — a second call just resets it to the intro.
+    fn show_onboarding(&mut self, root: &adw::ApplicationWindow, sender: &ComponentSender<Self>) {
+        match &self.onboarding {
+            None => {
+                let onboarding = Self::build_onboarding(sender);
+                onboarding.dialog.present(Some(root));
+                self.onboarding = Some(onboarding);
+            }
+            Some(onboarding) => {
+                onboarding.stack.set_visible_child_name("intro");
+            }
+        }
+        self.state = ViewState::SignedOut;
+        self.device = None;
+        self.signout_action.set_enabled(false);
+    }
+
+    /// Close the modal (if any) and move to the connected app.
+    fn go_ready(&mut self, connection: Connection) {
+        if let Some(onboarding) = self.onboarding.take() {
+            onboarding.dialog.force_close();
+        }
+        self.connection = Some(connection);
+        self.state = ViewState::Ready;
+        self.device = None;
+        self.signout_action.set_enabled(true);
     }
 
     /// Load a saved token off-thread and, if there is one, build and verify a
@@ -174,9 +348,6 @@ impl AppModel {
             match secret::load().await {
                 Ok(Some(token)) => CommandMsg::Connected(Box::new(client::connect(token).await)),
                 Ok(None) => CommandMsg::NoToken,
-                // The keyring itself failed (no Secret Service running, locked,
-                // …). Not an auth problem — treat it as disconnected with the
-                // reason, so the user can retry once it's available.
                 Err(err) => CommandMsg::Connected(Box::new(Err(ConnectError::Other(format!(
                     "Couldn't read the keyring: {err:#}"
                 ))))),
@@ -195,8 +366,6 @@ impl Component for AppModel {
     view! {
         adw::ApplicationWindow {
             set_title: Some("Pitwall"),
-            // Opens wide: the run list and detail page (later milestones) want
-            // the room, and it's the size the app should feel like from the off.
             set_default_size: (900, 720),
 
             #[local_ref]
@@ -210,20 +379,19 @@ impl Component for AppModel {
                             set_subtitle: &model.header_subtitle(),
                         },
 
-                        // The primary menu — the GNOME hamburger. A real
-                        // `gio::Menu` model, so its items invoke `GAction`s and
-                        // get keyboard/screen-reader behaviour for free.
+                        // The menu model is built imperatively in `init` (so the
+                        // Sign Out item can carry `hidden-when="action-disabled"`)
+                        // and set on this button there.
+                        #[name = "menu_button"]
                         pack_end = &gtk::MenuButton {
                             set_icon_name: "open-menu-symbolic",
                             set_tooltip_text: Some("Main Menu"),
-                            set_menu_model: Some(&primary_menu),
                         },
                     },
 
-                    // One page per state. A `gtk::Stack` (not an `if`/`match`)
-                    // so the interactive widgets are built once and can be wired
-                    // up in `init`, and so switching states never re-parents
-                    // anything.
+                    // One page per state. Onboarding (sign-in) is a modal over
+                    // this, not a page here — so this stack is just loading /
+                    // signed-out backdrop / the app / disconnected.
                     #[wrap(Some)]
                     set_content = &gtk::Stack {
                         add_named[Some("loading")] = &gtk::Box {
@@ -236,87 +404,14 @@ impl Component for AppModel {
                             },
                         },
 
-                        add_named[Some("needs-auth")] = &adw::StatusPage {
-                            set_icon_name: Some("dialog-password-symbolic"),
-                            set_title: "Connect to GitHub",
-                            set_description: Some(
-                                "Sign in to start monitoring your workflow runs. Pitwall opens \
-                                 GitHub in your browser to authorise read access to your \
-                                 repositories’ Actions.",
-                            ),
-
-                            #[wrap(Some)]
-                            set_child = &gtk::Box {
-                                set_halign: gtk::Align::Center,
-
-                                #[name = "signin_button"]
-                                gtk::Button {
-                                    set_label: "Sign in with GitHub",
-                                    add_css_class: "suggested-action",
-                                    add_css_class: "pill",
-                                },
-                            },
+                        // The neutral backdrop behind the onboarding modal.
+                        add_named[Some("welcome")] = &adw::StatusPage {
+                            set_icon_name: Some(crate::APP_ID),
+                            set_title: "Pitwall",
+                            set_description: Some("Sign in to start monitoring your workflow runs."),
                         },
 
-                        add_named[Some("awaiting-auth")] = &adw::StatusPage {
-                            set_icon_name: Some("dialog-password-symbolic"),
-                            set_title: "Authorize Pitwall",
-                            set_description: Some(
-                                "We opened github.com/login/device in your browser and copied \
-                                 your code. Enter it there and approve access.",
-                            ),
-
-                            #[wrap(Some)]
-                            set_child = &gtk::Box {
-                                set_orientation: gtk::Orientation::Vertical,
-                                set_spacing: 18,
-                                set_halign: gtk::Align::Center,
-
-                                // The user code, big and selectable.
-                                gtk::Label {
-                                    #[watch]
-                                    set_label: &model.device_user_code(),
-                                    add_css_class: "title-1",
-                                    add_css_class: "numeric",
-                                    set_selectable: true,
-                                },
-
-                                gtk::Box {
-                                    set_spacing: 6,
-                                    set_halign: gtk::Align::Center,
-
-                                    #[name = "open_button"]
-                                    gtk::Button {
-                                        set_label: "Open GitHub",
-                                        add_css_class: "pill",
-                                    },
-                                    #[name = "copy_button"]
-                                    gtk::Button {
-                                        set_label: "Copy Code",
-                                        add_css_class: "pill",
-                                    },
-                                },
-
-                                gtk::Box {
-                                    set_spacing: 8,
-                                    set_halign: gtk::Align::Center,
-                                    gtk::Spinner { set_spinning: true },
-                                    gtk::Label {
-                                        set_label: "Waiting for authorization…",
-                                        add_css_class: "dim-label",
-                                    },
-                                },
-
-                                #[name = "cancel_button"]
-                                gtk::Button {
-                                    set_label: "Cancel",
-                                    set_halign: gtk::Align::Center,
-                                    add_css_class: "flat",
-                                },
-                            },
-                        },
-
-                        add_named[Some("ready")] = &adw::StatusPage {
+                        add_named[Some("app")] = &adw::StatusPage {
                             set_icon_name: Some("emblem-ok-symbolic"),
                             set_title: "Connected to GitHub",
                             #[watch]
@@ -341,8 +436,6 @@ impl Component for AppModel {
                             },
                         },
 
-                        // Set after the children exist — naming a missing child
-                        // is a GTK-CRITICAL.
                         #[watch]
                         set_visible_child_name: model.state_page(),
                     },
@@ -351,30 +444,30 @@ impl Component for AppModel {
         }
     }
 
-    // The primary menu's model. Sibling of `view!` (the component macro wires
-    // `primary_menu` into the tree above). Each item names a `GAction`, resolved
-    // against the "win" group registered on the window in `init`.
-    menu! {
-        primary_menu: {
-            section! {
-                "Sign Out" => SignOutAction,
-            },
-            section! {
-                "About Pitwall" => AboutAction,
-                "Quit" => QuitAction,
-            }
-        }
-    }
-
     fn init(
         settings: Self::Init,
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
+        // Built up front so its handle can live in the model and be toggled; the
+        // menu item that names it is `hidden-when="action-disabled"`, so starting
+        // disabled means Sign Out starts hidden.
+        let signout_action: RelmAction<SignOutAction> = {
+            let sender = sender.input_sender().clone();
+            RelmAction::new_stateless(move |_| {
+                sender.send(AppMsg::SignOut).ok();
+            })
+        };
+        signout_action.set_enabled(false);
+
         let model = AppModel {
             connection: None,
             state: ViewState::Loading,
+            device: None,
+            auth_gen: 0,
             toast_overlay: adw::ToastOverlay::new(),
+            onboarding: None,
+            signout_action: signout_action.gio_action().clone(),
             settings,
         };
 
@@ -382,35 +475,26 @@ impl Component for AppModel {
 
         let widgets = view_output!();
 
-        // Wire the buttons, here rather than in `view!` because each just posts a
-        // fixed message; the reducer reads the current state to act. `bridge`
-        // makes a click-to-message closure without repeating the boilerplate.
-        let bridge = |msg: AppMsg| {
-            let input = sender.input_sender().clone();
-            move |_: &gtk::Button| {
-                input.send(msg.clone()).ok();
-            }
-        };
-        widgets
-            .signin_button
-            .connect_clicked(bridge(AppMsg::SignIn));
-        widgets
-            .open_button
-            .connect_clicked(bridge(AppMsg::OpenVerification));
-        widgets
-            .copy_button
-            .connect_clicked(bridge(AppMsg::CopyCode));
-        widgets
-            .cancel_button
-            .connect_clicked(bridge(AppMsg::CancelAuth));
-        widgets.retry_button.connect_clicked(bridge(AppMsg::Retry));
+        // The primary menu, built by hand so Sign Out can carry the `hidden-when`
+        // attribute the `menu!` macro doesn't expose.
+        let menu = gio::Menu::new();
+        let account = gio::Menu::new();
+        let signout_item = gio::MenuItem::new(Some("Sign Out"), Some("win.sign-out"));
+        signout_item.set_attribute_value("hidden-when", Some(&"action-disabled".to_variant()));
+        account.append_item(&signout_item);
+        menu.append_section(None, &account);
+        let app_section = gio::Menu::new();
+        app_section.append(Some("About Pitwall"), Some("win.about"));
+        app_section.append(Some("Quit"), Some("win.quit"));
+        menu.append_section(None, &app_section);
+        widgets.menu_button.set_menu_model(Some(&menu));
 
-        // Menu actions. Each is a thin bridge that posts an `AppMsg`, so the
-        // work still lands in the one reducer — except Quit, which acts directly.
-        let signout_sender = sender.input_sender().clone();
-        let signout_action: RelmAction<SignOutAction> = RelmAction::new_stateless(move |_| {
-            signout_sender.send(AppMsg::SignOut).ok();
+        let retry_sender = sender.input_sender().clone();
+        widgets.retry_button.connect_clicked(move |_| {
+            retry_sender.send(AppMsg::Retry).ok();
         });
+
+        // Menu actions — thin bridges to `AppMsg` (Quit acts directly).
         let about_sender = sender.input_sender().clone();
         let about_action: RelmAction<AboutAction> = RelmAction::new_stateless(move |_| {
             about_sender.send(AppMsg::ShowAbout).ok();
@@ -437,7 +521,13 @@ impl Component for AppModel {
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>, root: &Self::Root) {
         match msg {
             AppMsg::SignIn => {
-                self.state = ViewState::Loading;
+                // A new sign-in supersedes any in-flight one.
+                self.auth_gen += 1;
+                let generation = self.auth_gen;
+                if let Some(onboarding) = &self.onboarding {
+                    onboarding.code_label.set_text("…");
+                    onboarding.stack.set_visible_child_name("awaiting");
+                }
                 // The whole device flow runs in one streaming command: get the
                 // code, push it to the UI, then poll until the user authorises.
                 // `drop_on_shutdown` cancels the poll if the app closes mid-flow.
@@ -447,15 +537,13 @@ impl Component for AppModel {
                             match client::start_device_flow().await {
                                 Ok(flow) => {
                                     out.send(CommandMsg::DeviceCode {
+                                        generation,
                                         user_code: flow.user_code.clone(),
                                         verification_uri: flow.verification_uri.clone(),
                                     })
                                     .ok();
                                     let result = match flow.poll().await {
                                         Ok(token) => {
-                                            // Store only a token that then
-                                            // verifies (below); a store failure
-                                            // is rare and non-fatal.
                                             if let Err(err) = secret::store(&token).await {
                                                 tracing::warn!(
                                                     "couldn't save token to keyring: {err:#}"
@@ -465,10 +553,18 @@ impl Component for AppModel {
                                         }
                                         Err(err) => Err(err),
                                     };
-                                    out.send(CommandMsg::DeviceResult(Box::new(result))).ok();
+                                    out.send(CommandMsg::DeviceResult {
+                                        generation,
+                                        result: Box::new(result),
+                                    })
+                                    .ok();
                                 }
                                 Err(err) => {
-                                    out.send(CommandMsg::DeviceResult(Box::new(Err(err)))).ok();
+                                    out.send(CommandMsg::DeviceResult {
+                                        generation,
+                                        result: Box::new(Err(err)),
+                                    })
+                                    .ok();
                                 }
                             }
                         })
@@ -478,26 +574,30 @@ impl Component for AppModel {
             }
 
             AppMsg::OpenVerification => {
-                if let ViewState::AwaitingAuth {
-                    verification_uri, ..
-                } = &self.state
-                {
-                    Self::open_uri(&verification_uri.clone(), root);
+                if let Some((_, uri)) = &self.device {
+                    Self::open_uri(uri, root);
                 }
             }
 
             AppMsg::CopyCode => {
-                if let ViewState::AwaitingAuth { user_code, .. } = &self.state {
-                    root.clipboard().set_text(user_code);
-                    self.toast("Code copied");
+                if let Some((code, _)) = &self.device {
+                    root.clipboard().set_text(code);
+                }
+                if let Some(onboarding) = &self.onboarding {
+                    onboarding
+                        .toast_overlay
+                        .add_toast(adw::Toast::new("Code copied"));
                 }
             }
 
             AppMsg::CancelAuth => {
-                // The background poll for this code is now orphaned; it's ignored
-                // on arrival (the guards in `update_cmd` only accept a result
-                // while we're still awaiting) and expires on GitHub's side.
-                self.state = ViewState::NeedsAuth;
+                // Invalidate the in-flight flow; its late result is ignored by
+                // the generation check. The orphaned poll expires on GitHub's side.
+                self.auth_gen += 1;
+                self.device = None;
+                if let Some(onboarding) = &self.onboarding {
+                    onboarding.stack.set_visible_child_name("intro");
+                }
             }
 
             AppMsg::SignOut => {
@@ -515,10 +615,6 @@ impl Component for AppModel {
             }
 
             AppMsg::ShowAbout => {
-                // A standard adw::AboutDialog from our own metadata. `Gpl30` is
-                // GTK's name for "v3 or later"; it renders the full notice so we
-                // don't hand-write it. The icon resolves to the installed themed
-                // icon (a generic fallback before `make install`).
                 let about = adw::AboutDialog::builder()
                     .application_name("Pitwall")
                     .application_icon(crate::APP_ID)
@@ -538,81 +634,84 @@ impl Component for AppModel {
     fn update_cmd(
         &mut self,
         msg: Self::CommandOutput,
-        _sender: ComponentSender<Self>,
+        sender: ComponentSender<Self>,
         root: &Self::Root,
     ) {
         match msg {
             CommandMsg::Connected(result) => match *result {
                 Ok(connection) => {
-                    tracing::debug!(
-                        login = %connection.login,
-                        remaining = connection.rate.remaining,
-                        "connected",
-                    );
-                    self.connection = Some(connection);
-                    self.state = ViewState::Ready;
-                    // (Run-list milestone: start the poll here.)
+                    tracing::debug!(login = %connection.login, "connected");
+                    self.go_ready(connection);
                 }
                 Err(err) => {
                     if err.is_auth() {
-                        // A stored token that's now invalid: back to sign-in, with
-                        // the reason as a toast so it isn't silently swallowed.
+                        // A stored token that's now invalid: onboarding, with the
+                        // reason toasted onto the modal.
                         self.connection = None;
-                        self.toast(err.message());
-                        self.state = ViewState::NeedsAuth;
+                        self.show_onboarding(root, &sender);
+                        if let Some(onboarding) = &self.onboarding {
+                            onboarding
+                                .toast_overlay
+                                .add_toast(adw::Toast::new(err.message()));
+                        }
                     } else {
+                        if let Some(onboarding) = self.onboarding.take() {
+                            onboarding.dialog.force_close();
+                        }
+                        self.connection = None;
                         self.state = ViewState::Disconnected(err.message().to_owned());
+                        self.signout_action.set_enabled(false);
                     }
                 }
             },
 
             CommandMsg::NoToken => {
-                self.state = ViewState::NeedsAuth;
+                self.show_onboarding(root, &sender);
             }
 
             CommandMsg::TokenCleared => {
                 self.connection = None;
-                self.state = ViewState::NeedsAuth;
+                self.show_onboarding(root, &sender);
             }
 
             CommandMsg::DeviceCode {
+                generation,
                 user_code,
                 verification_uri,
             } => {
-                // Ignore a code from a sign-in the user has since cancelled.
-                if !matches!(
-                    self.state,
-                    ViewState::Loading | ViewState::AwaitingAuth { .. }
-                ) {
+                if generation != self.auth_gen {
                     return;
+                }
+                if let Some(onboarding) = &self.onboarding {
+                    onboarding.code_label.set_text(&user_code);
+                    onboarding.stack.set_visible_child_name("awaiting");
                 }
                 // Open the browser to the device page and copy the code, so the
                 // user just enters it and approves.
                 root.clipboard().set_text(&user_code);
                 Self::open_uri(&verification_uri, root);
-                self.state = ViewState::AwaitingAuth {
-                    user_code,
-                    verification_uri,
-                };
+                self.device = Some((user_code, verification_uri));
             }
 
-            CommandMsg::DeviceResult(result) => {
-                // Only act on a result for the sign-in we're still awaiting — an
-                // orphaned (cancelled) flow's late result is dropped here.
-                if !matches!(self.state, ViewState::AwaitingAuth { .. }) {
+            CommandMsg::DeviceResult { generation, result } => {
+                if generation != self.auth_gen {
                     return;
                 }
+                self.device = None;
                 match *result {
                     Ok(connection) => {
                         tracing::debug!(login = %connection.login, "signed in");
-                        self.connection = Some(connection);
-                        self.state = ViewState::Ready;
+                        self.go_ready(connection);
                     }
                     Err(err) => {
-                        // Denied, timed out, or a network blip after authorising:
-                        // back to the sign-in screen with the reason.
-                        self.toast(err.message());
-                        self.state = ViewState::NeedsAuth;
+                        // Denied, timed out, or a blip after authorising: back to
+                        // the intro, with the reason toasted onto the modal.
+                        if let Some(onboarding) = &self.onboarding {
+                            onboarding.stack.set_visible_child_name("intro");
+                            onboarding
+                                .toast_overlay
+                                .add_toast(adw::Toast::new(err.message()));
+                        }
                     }
                 }
             }
