@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Pitwall
+GenericName=CI Monitor
+Comment=Monitor your GitHub Actions runs, natively
+Exec=pitwall
+Icon=dev.miguelrincon.Pitwall
+Terminal=false
+Categories=Development;GTK;
+Keywords=GitHub;Actions;CI;Workflow;Runs;
+StartupNotify=true
+StartupWMClass=dev.miguelrincon.Pitwall
+X-GNOME-UsesNotifications=true
