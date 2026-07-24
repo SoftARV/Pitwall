@@ -35,7 +35,7 @@ use crate::github::client::{self, ConnectError, Connection, RepoRuns, RunsOutcom
 use crate::github::types::{Conclusion, RateLimit, RunStatus, WorkflowRun};
 use crate::notify;
 use crate::secret;
-use crate::settings::{NotifyOn, Settings};
+use crate::settings::{MAX_POLL_INTERVAL, MIN_POLL_INTERVAL, NotifyOn, Settings, Theme};
 
 // The primary menu's action group. GTK menu items invoke `GAction`s by name;
 // this defines the "win" group and its stateless actions (fully qualified, e.g.
@@ -48,11 +48,6 @@ relm4::new_stateless_action!(SignOutAction, AppMenuActionGroup, "sign-out");
 relm4::new_stateless_action!(PreferencesAction, AppMenuActionGroup, "preferences");
 relm4::new_stateless_action!(AboutAction, AppMenuActionGroup, "about");
 relm4::new_stateless_action!(QuitAction, AppMenuActionGroup, "quit");
-
-/// Poll interval for the run list. 45s is CLAUDE.md's default; the timer is
-/// removed entirely while the window is hidden (rule 3), so a backgrounded
-/// Pitwall costs nothing against the rate budget.
-const POLL_INTERVAL_SECS: u32 = 45;
 
 // The one bit of custom CSS: a black "Sign in with GitHub" button, so it's
 // instantly recognisable and stands out on the modal (the earlier grey blended
@@ -259,6 +254,10 @@ pub enum AppMsg {
     ShowPreferences,
     /// The notifications preference changed (from Preferences).
     SetNotifyOn(NotifyOn),
+    /// The theme changed (from Preferences) — applied immediately.
+    SetTheme(Theme),
+    /// The poll interval changed (from Preferences) — restarts the timer.
+    SetPollInterval(u32),
     /// Open the About dialog (primary menu).
     ShowAbout,
 }
@@ -372,7 +371,7 @@ impl AppModel {
         }
         let input = sender.input_sender().clone();
         self.poll = Some(glib::timeout_add_seconds_local(
-            POLL_INTERVAL_SECS,
+            self.settings.poll_interval,
             move || {
                 input.send(AppMsg::Refresh).ok();
                 glib::ControlFlow::Continue
@@ -496,11 +495,63 @@ impl AppModel {
     /// posts `SetNotifyOn` on change. (The poll interval and theme land here in
     /// M7 — this is the group they'll join.)
     fn present_preferences(&self, sender: &ComponentSender<Self>, root: &adw::ApplicationWindow) {
-        let group = adw::PreferencesGroup::builder()
+        let page = adw::PreferencesPage::new();
+
+        // Appearance — theme. Applied live via adw::StyleManager. The handler is
+        // connected *after* set_selected so the initial sync doesn't post a msg.
+        let appearance = adw::PreferencesGroup::builder().title("Appearance").build();
+        let theme = adw::ComboRow::builder().title("Theme").build();
+        theme.set_model(Some(&gtk::StringList::new(&[
+            "Follow system",
+            "Light",
+            "Dark",
+        ])));
+        theme.set_selected(match self.settings.theme {
+            Theme::System => 0,
+            Theme::Light => 1,
+            Theme::Dark => 2,
+        });
+        let theme_sender = sender.input_sender().clone();
+        theme.connect_selected_notify(move |row| {
+            let theme = match row.selected() {
+                1 => Theme::Light,
+                2 => Theme::Dark,
+                _ => Theme::System,
+            };
+            theme_sender.send(AppMsg::SetTheme(theme)).ok();
+        });
+        appearance.add(&theme);
+        page.add(&appearance);
+
+        // Refresh — the background poll interval.
+        let refresh = adw::PreferencesGroup::builder()
+            .title("Refresh")
+            .description("How often to check watched repositories in the background.")
+            .build();
+        let adjustment = gtk::Adjustment::new(
+            self.settings.poll_interval as f64,
+            MIN_POLL_INTERVAL as f64,
+            MAX_POLL_INTERVAL as f64,
+            5.0,
+            15.0,
+            0.0,
+        );
+        let interval = adw::SpinRow::new(Some(&adjustment), 1.0, 0);
+        interval.set_title("Interval (seconds)");
+        let interval_sender = sender.input_sender().clone();
+        interval.connect_value_notify(move |row| {
+            interval_sender
+                .send(AppMsg::SetPollInterval(row.value() as u32))
+                .ok();
+        });
+        refresh.add(&interval);
+        page.add(&refresh);
+
+        // Notifications.
+        let notifications = adw::PreferencesGroup::builder()
             .title("Notifications")
             .description("Desktop alerts when a watched run finishes.")
             .build();
-
         let combo = adw::ComboRow::builder().title("Notify me").build();
         combo.set_model(Some(&gtk::StringList::new(&[
             "Off",
@@ -521,10 +572,9 @@ impl AppModel {
             };
             combo_sender.send(AppMsg::SetNotifyOn(on)).ok();
         });
-        group.add(&combo);
+        notifications.add(&combo);
+        page.add(&notifications);
 
-        let page = adw::PreferencesPage::new();
-        page.add(&group);
         let dialog = adw::PreferencesDialog::new();
         dialog.add(&page);
         dialog.present(Some(root));
@@ -1509,6 +1559,22 @@ impl Component for AppModel {
             AppMsg::SetNotifyOn(on) => {
                 self.settings.notify_on = on;
                 self.settings.save();
+            }
+
+            AppMsg::SetTheme(theme) => {
+                self.settings.theme = theme;
+                self.settings.save();
+                self.settings.apply_theme();
+            }
+
+            AppMsg::SetPollInterval(secs) => {
+                self.settings.poll_interval = secs.clamp(MIN_POLL_INTERVAL, MAX_POLL_INTERVAL);
+                self.settings.save();
+                // Restart the timer so the new interval takes effect now. Both
+                // calls are no-ops if we aren't currently polling (hidden or
+                // disconnected), so it just picks up next time polling resumes.
+                self.stop_poll();
+                self.start_poll(&sender);
             }
 
             AppMsg::ShowAbout => {

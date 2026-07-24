@@ -99,8 +99,15 @@ impl NotifyOn {
     }
 }
 
+/// Background poll interval bounds, in seconds. 45s is CLAUDE.md's default; the
+/// 20s floor keeps the rate budget safe, and 300s (5 min) is a sensible ceiling
+/// for a monitor. The Preferences spin and the config loader both clamp to this.
+pub const DEFAULT_POLL_INTERVAL: u32 = 45;
+pub const MIN_POLL_INTERVAL: u32 = 20;
+pub const MAX_POLL_INTERVAL: u32 = 300;
+
 /// The app's global settings. Loaded once at startup, saved on every change.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Settings {
     pub theme: Theme,
     /// The hand-picked repos to monitor, as `"owner/name"`. Empty until the user
@@ -108,6 +115,19 @@ pub struct Settings {
     pub watched: Vec<String>,
     /// When to raise a desktop notification for a finished run.
     pub notify_on: NotifyOn,
+    /// Seconds between background polls, clamped to `[MIN, MAX]_POLL_INTERVAL`.
+    pub poll_interval: u32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            theme: Theme::default(),
+            watched: Vec::new(),
+            notify_on: NotifyOn::default(),
+            poll_interval: DEFAULT_POLL_INTERVAL,
+        }
+    }
 }
 
 impl Settings {
@@ -141,6 +161,12 @@ impl Settings {
         if let Ok(on) = keyfile.string("notifications", "on") {
             settings.notify_on = NotifyOn::from_key(&on);
         }
+        // Clamp on load too: a hand-edited config shouldn't be able to poll below
+        // the floor and burn the rate budget.
+        if let Ok(secs) = keyfile.integer("polling", "interval") {
+            settings.poll_interval =
+                (secs.max(0) as u32).clamp(MIN_POLL_INTERVAL, MAX_POLL_INTERVAL);
+        }
 
         settings
     }
@@ -152,6 +178,7 @@ impl Settings {
         keyfile.set_string("appearance", "theme", self.theme.as_key());
         keyfile.set_string("watchlist", "repos", &self.watched.join(","));
         keyfile.set_string("notifications", "on", self.notify_on.as_key());
+        keyfile.set_integer("polling", "interval", self.poll_interval as i32);
 
         let path = config_path();
         if let Some(dir) = path.parent()
