@@ -78,6 +78,11 @@ pub enum RunStatus {
     Queued,
     InProgress,
     Completed,
+    /// Client-side only: we've asked GitHub to cancel this run and it hasn't
+    /// finished stopping yet. GitHub reports no such status (the run stays
+    /// `in_progress` until fully cancelled), so `from_api` / `from_status` never
+    /// produce it — the app overlays it for immediate, lasting feedback.
+    Cancelling,
     /// A status string we don't recognise — surfaced as-is rather than guessed.
     Unknown,
 }
@@ -106,7 +111,10 @@ impl RunStatus {
     /// A run still doing work — the poll should stay attentive to these (adaptive
     /// polling, later), and the header counts them as "running".
     pub fn is_active(self) -> bool {
-        matches!(self, RunStatus::Queued | RunStatus::InProgress)
+        matches!(
+            self,
+            RunStatus::Queued | RunStatus::InProgress | RunStatus::Cancelling
+        )
     }
 }
 
@@ -218,7 +226,8 @@ impl WorkflowRun {
 }
 
 /// One job in a run — the unit the detail page lists, each with its steps.
-#[derive(Debug, Clone)]
+/// `PartialEq` lets the detail skip rebuilding when a refresh brings no change.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
     /// GitHub's job id — the key to the per-job log endpoint.
     pub id: u64,
@@ -245,7 +254,7 @@ impl Job {
 }
 
 /// One step within a job.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
     pub name: String,
     pub status: RunStatus,

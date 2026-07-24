@@ -54,6 +54,7 @@ pub fn label(status: RunStatus, conclusion: Option<Conclusion>) -> &'static str 
     match status {
         RunStatus::Queued => "Queued",
         RunStatus::InProgress => "Running",
+        RunStatus::Cancelling => "Cancelling…",
         RunStatus::Unknown => "Unknown",
         RunStatus::Completed => match conclusion {
             Some(Conclusion::Success) => "Success",
@@ -76,6 +77,7 @@ pub fn variant(status: RunStatus, conclusion: Option<Conclusion>) -> &'static st
     match status {
         RunStatus::Queued => "warning",
         RunStatus::InProgress => "accent",
+        RunStatus::Cancelling => "warning",
         RunStatus::Unknown => "neutral",
         RunStatus::Completed => match conclusion {
             Some(Conclusion::Success) => "success",

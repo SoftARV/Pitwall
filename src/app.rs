@@ -14,7 +14,7 @@
 //! code + browser authorisation → the modal closes onto the app. A saved token
 //! in the keyring reconnects silently at startup, skipping the modal entirely.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
@@ -29,10 +29,10 @@ use relm4::{
 
 use crate::components::log_view::{LogView, LogViewInit, LogViewOutput};
 use crate::components::repo_picker::{RepoPicker, RepoPickerInit, RepoPickerOutput};
-use crate::components::run_detail::{RunDetail, RunDetailInit, RunDetailOutput};
+use crate::components::run_detail::{RunDetail, RunDetailInit, RunDetailInput, RunDetailOutput};
 use crate::components::run_row::{RunRow, RunRowInput, RunRowOutput};
 use crate::github::client::{self, ConnectError, Connection, RepoRuns, RunsOutcome};
-use crate::github::types::{Conclusion, RateLimit, WorkflowRun};
+use crate::github::types::{Conclusion, RateLimit, RunStatus, WorkflowRun};
 use crate::notify;
 use crate::secret;
 use crate::settings::{NotifyOn, Settings};
@@ -98,6 +98,44 @@ struct Onboarding {
     toast_overlay: adw::ToastOverlay,
 }
 
+/// A run action in flight — for the `pending` gate, the toasts, and reporting
+/// which action a result belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunAction {
+    Rerun,
+    RerunFailed,
+    Cancel,
+}
+
+impl RunAction {
+    /// Naming the action for an error toast: "Re-run failed: …".
+    fn label(self) -> &'static str {
+        match self {
+            RunAction::Rerun => "Re-run",
+            RunAction::RerunFailed => "Re-run failed jobs",
+            RunAction::Cancel => "Cancel",
+        }
+    }
+
+    /// The optimistic toast shown when the request goes out.
+    fn in_progress(self) -> &'static str {
+        match self {
+            RunAction::Rerun => "Re-running…",
+            RunAction::RerunFailed => "Re-running failed jobs…",
+            RunAction::Cancel => "Cancelling run…",
+        }
+    }
+
+    /// The toast shown once GitHub has accepted the request.
+    fn accepted(self) -> &'static str {
+        match self {
+            RunAction::Rerun => "Re-run queued",
+            RunAction::RerunFailed => "Re-run of failed jobs queued",
+            RunAction::Cancel => "Cancellation requested",
+        }
+    }
+}
+
 pub struct AppModel {
     connection: Option<Connection>,
     state: ViewState,
@@ -120,6 +158,9 @@ pub struct AppModel {
     /// The run detail page, while one is open. Holding the `Controller` keeps it
     /// (and its jobs fetch) alive; dropping it on navigate-back shuts it down.
     detail: Option<Controller<RunDetail>>,
+    /// The run id the open detail is showing — so each poll can forward that run's
+    /// fresh data to keep the detail page live.
+    detail_id: Option<u64>,
     /// The step-log page, while one is open (pushed on top of the detail).
     log_view: Option<Controller<LogView>>,
     /// The watched repos as `owner/name`, mirrored from settings for the view.
@@ -141,6 +182,14 @@ pub struct AppModel {
     /// re-run's fresh finish from an unchanged one. Seeded silently on the first
     /// poll (so pre-existing failures don't all alert at startup).
     last_finished: HashMap<u64, (Conclusion, DateTime<Utc>)>,
+    /// Run actions (re-run / cancel) in flight, keyed by run id — gates a second
+    /// click on the same run until the first returns.
+    pending: HashMap<u64, RunAction>,
+    /// Runs we've asked to cancel that GitHub hasn't finished stopping. Their
+    /// status is overlaid as `Cancelling` for immediate, lasting feedback, until a
+    /// poll shows them completed (then they're pruned). GitHub has no cancelling
+    /// status of its own, so this bridges the gap while it stops the jobs.
+    cancelling: HashSet<u64>,
     /// The latest rate-limit budget, from the poll's response headers.
     rate: Option<RateLimit>,
     /// Whether a poll has landed since connecting: tells "still loading" apart
@@ -194,6 +243,14 @@ pub enum AppMsg {
     },
     /// A pushed page was popped (back / Escape) — drop the top-most controller.
     DetailClosed,
+    /// Re-run all of a run's jobs (row action menu).
+    Rerun(u64),
+    /// Re-run only a run's failed jobs (row action menu).
+    RerunFailed(u64),
+    /// Cancel an in-progress run — shows a confirmation first (row action menu).
+    Cancel(u64),
+    /// The cancel confirmation was accepted — actually send it.
+    CancelConfirmed(u64),
     /// Open a run on github.com (the row's browser button).
     OpenInBrowser(String),
     /// The window became visible / hidden — gates the poll (rule 3).
@@ -230,6 +287,13 @@ pub enum CommandMsg {
     },
     /// A conditional poll came back (per-repo outcomes + the rate budget).
     RunsPolled(Box<client::Poll>),
+    /// A run action (re-run / cancel) finished — carries which run and action so
+    /// the reducer can clear `pending` and toast the outcome.
+    ActionDone {
+        id: u64,
+        action: RunAction,
+        result: Result<(), String>,
+    },
 }
 
 impl AppModel {
@@ -360,6 +424,22 @@ impl AppModel {
             .cloned()
             .collect();
         runs.sort_by_key(|run| std::cmp::Reverse(run.created_at));
+
+        // Overlay a client-side "Cancelling" on runs we've asked to cancel, until
+        // GitHub actually finishes (they go completed) — then drop them from the
+        // set. This gives immediate, lasting feedback while GitHub takes its time
+        // stopping the jobs (the run reports `in_progress` throughout). Applied
+        // here, on every rebuild, so it survives each poll's real data.
+        self.cancelling.retain(|id| {
+            runs.iter()
+                .any(|run| run.id == *id && run.status != RunStatus::Completed)
+        });
+        for run in &mut runs {
+            if self.cancelling.contains(&run.id) {
+                run.status = RunStatus::Cancelling;
+            }
+        }
+
         self.all_runs = runs;
     }
 
@@ -447,6 +527,131 @@ impl AppModel {
         page.add(&group);
         let dialog = adw::PreferencesDialog::new();
         dialog.add(&page);
+        dialog.present(Some(root));
+    }
+
+    /// Fire a run action off-thread. Gated by `pending` so a double click on the
+    /// same run can't launch it twice; an optimistic toast goes out immediately,
+    /// and `ActionDone` reports the real outcome (rule 5: no blocking).
+    fn dispatch_action(&mut self, id: u64, action: RunAction, sender: &ComponentSender<Self>) {
+        let Some(connection) = &self.connection else {
+            return;
+        };
+        if self.pending.contains_key(&id) {
+            return;
+        }
+        // Resolve the run's `owner/name` from the id — the action endpoints are
+        // per-repo, and the row only handed us the id.
+        let Some(run) = self.all_runs.iter().find(|run| run.id == id) else {
+            return;
+        };
+        let Some((owner, name)) = run.repo.split_once('/') else {
+            return;
+        };
+        let (owner, name) = (owner.to_owned(), name.to_owned());
+
+        self.pending.insert(id, action);
+        self.toast(action.in_progress());
+
+        let octocrab = connection.octocrab.clone();
+        sender.oneshot_command(async move {
+            let result = match action {
+                RunAction::Rerun => client::rerun_run(&octocrab, &owner, &name, id).await,
+                RunAction::RerunFailed => {
+                    client::rerun_failed_jobs(&octocrab, &owner, &name, id).await
+                }
+                RunAction::Cancel => client::cancel_run(&octocrab, &owner, &name, id).await,
+            };
+            CommandMsg::ActionDone { id, action, result }
+        });
+    }
+
+    /// Optimistically reflect a re-run: the run flips back to *queued* at once, so
+    /// the row updates without waiting for GitHub's list API to catch up.
+    ///
+    /// This is safe against a stale-poll flip-back because of the ETag: until the
+    /// server's list actually changes it answers 304 (leaving our optimistic state
+    /// untouched), and when it *does* change, the 200 we get already carries the
+    /// new queued/running state — never the old "completed" one. Mutates the
+    /// per-repo cache (the source `all_runs` is rebuilt from), not just `all_runs`.
+    fn mark_rerunning(&mut self, id: u64) {
+        for runs in self.runs_by_repo.values_mut() {
+            if let Some(run) = runs.iter_mut().find(|run| run.id == id) {
+                run.status = RunStatus::Queued;
+                run.conclusion = None;
+                break;
+            }
+        }
+        self.rebuild_runs();
+        self.apply_runs();
+        self.refresh_detail();
+    }
+
+    /// Optimistically reflect a cancel: mark the run `Cancelling` at once (the
+    /// overlay in `rebuild_runs` applies it), so the chip changes immediately
+    /// rather than reading "Running" for the many seconds GitHub takes to stop it.
+    fn mark_cancelling(&mut self, id: u64) {
+        self.cancelling.insert(id);
+        self.rebuild_runs();
+        self.apply_runs();
+        self.refresh_detail();
+    }
+
+    /// Keep an open detail page live: forward the current data for the run it's
+    /// showing, which drives its metadata and re-fetches its jobs. A no-op when no
+    /// detail is open. Called after each poll and each optimistic list change.
+    fn refresh_detail(&self) {
+        let Some(id) = self.detail_id else {
+            return;
+        };
+        let Some(detail) = &self.detail else {
+            return;
+        };
+        if let Some(run) = self.all_runs.iter().find(|run| run.id == id) {
+            detail
+                .sender()
+                .send(RunDetailInput::Refresh(Box::new(run.clone())))
+                .ok();
+        }
+    }
+
+    /// After an action, GitHub's list API lags a beat behind the 201/202 — the
+    /// immediate poll usually still 304s. Schedule a couple of quick follow-ups so
+    /// the row settles on the real state within seconds, not at the next full
+    /// poll. They're conditional too, so a repo that hasn't changed stays free.
+    fn schedule_action_followups(&self, sender: &ComponentSender<Self>) {
+        for delay in [3, 9] {
+            let refresh_sender = sender.input_sender().clone();
+            glib::timeout_add_seconds_local_once(delay, move || {
+                refresh_sender.send(AppMsg::Refresh).ok();
+            });
+        }
+    }
+
+    /// Cancelling stops work, so confirm first (CLAUDE.md M5). The accepted
+    /// response posts `CancelConfirmed`, which does the actual dispatch.
+    fn confirm_cancel(
+        &self,
+        id: u64,
+        sender: &ComponentSender<Self>,
+        root: &adw::ApplicationWindow,
+    ) {
+        let dialog = adw::AlertDialog::new(
+            Some("Cancel this run?"),
+            Some("The workflow run will stop where it is."),
+        );
+        dialog.add_response("keep", "Keep Running");
+        dialog.add_response("cancel", "Cancel Run");
+        dialog.set_response_appearance("cancel", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("keep"));
+        dialog.set_close_response("keep");
+
+        let confirm_sender = sender.input_sender().clone();
+        dialog.connect_response(None, move |_, response| {
+            if response == "cancel" {
+                confirm_sender.send(AppMsg::CancelConfirmed(id)).ok();
+            }
+        });
         dialog.present(Some(root));
     }
 
@@ -665,6 +870,7 @@ impl AppModel {
         self.etags.clear();
         self.all_runs.clear();
         self.last_finished.clear();
+        self.cancelling.clear();
         self.runs.guard().clear();
         self.runs_loaded = false;
         self.set_signed_in(true);
@@ -904,12 +1110,15 @@ impl Component for AppModel {
             repo_picker: None,
             nav: adw::NavigationView::new(),
             detail: None,
+            detail_id: None,
             log_view: None,
             runs,
             all_runs: Vec::new(),
             runs_by_repo: HashMap::new(),
             etags: HashMap::new(),
             last_finished: HashMap::new(),
+            pending: HashMap::new(),
+            cancelling: HashSet::new(),
             rate: None,
             runs_loaded: false,
             refreshing: false,
@@ -1009,6 +1218,27 @@ impl Component for AppModel {
             }
         });
         app.add_action(&open_run);
+
+        // Per-run action menu (re-run / re-run failed / cancel). The menu items in
+        // each row target these by the run's id (a `u64`/uint64 GVariant), so one
+        // shared action group serves every row. Registered on the window as the
+        // "runs" group; the factory rows are descendants, so the menus resolve it.
+        let run_actions = gio::SimpleActionGroup::new();
+        for (name, msg) in [
+            ("rerun", AppMsg::Rerun as fn(u64) -> AppMsg),
+            ("rerun-failed", AppMsg::RerunFailed),
+            ("cancel", AppMsg::Cancel),
+        ] {
+            let action = gio::SimpleAction::new(name, Some(glib::VariantTy::UINT64));
+            let action_sender = sender.input_sender().clone();
+            action.connect_activate(move |_, param| {
+                if let Some(id) = param.and_then(|value| value.get::<u64>()) {
+                    action_sender.send(msg(id)).ok();
+                }
+            });
+            run_actions.add_action(&action);
+        }
+        root.insert_action_group("runs", Some(&run_actions));
 
         // Let GTK tell us when the window isn't worth polling for — minimised,
         // fully obscured, or on another workspace all count as "suspended".
@@ -1179,6 +1409,11 @@ impl Component for AppModel {
 
             AppMsg::OpenInBrowser(url) => Self::open_uri(&url, root),
 
+            AppMsg::Rerun(id) => self.dispatch_action(id, RunAction::Rerun, &sender),
+            AppMsg::RerunFailed(id) => self.dispatch_action(id, RunAction::RerunFailed, &sender),
+            AppMsg::Cancel(id) => self.confirm_cancel(id, &sender, root),
+            AppMsg::CancelConfirmed(id) => self.dispatch_action(id, RunAction::Cancel, &sender),
+
             AppMsg::ShowDetails(id) => {
                 let Some(connection) = &self.connection else {
                     return;
@@ -1209,6 +1444,7 @@ impl Component for AppModel {
                     });
                 self.nav.push(controller.widget());
                 self.detail = Some(controller);
+                self.detail_id = Some(id);
             }
 
             AppMsg::ShowJobLog {
@@ -1244,6 +1480,7 @@ impl Component for AppModel {
                     self.log_view = None;
                 } else {
                     self.detail = None;
+                    self.detail_id = None;
                 }
             }
 
@@ -1437,6 +1674,27 @@ impl Component for AppModel {
                 self.detect_and_notify(!self.runs_loaded);
                 self.runs_loaded = true;
                 self.apply_runs();
+                self.refresh_detail();
+            }
+
+            CommandMsg::ActionDone { id, action, result } => {
+                self.pending.remove(&id);
+                match result {
+                    Ok(()) => {
+                        self.toast(action.accepted());
+                        // Show the knowable next state at once: re-run → queued,
+                        // cancel → cancelling (held until GitHub finishes).
+                        match action {
+                            RunAction::Rerun | RunAction::RerunFailed => self.mark_rerunning(id),
+                            RunAction::Cancel => self.mark_cancelling(id),
+                        }
+                        // Poll now, then a couple of quick follow-ups to catch the
+                        // server catching up (the immediate one usually 304s).
+                        self.dispatch_refresh(&sender);
+                        self.schedule_action_followups(&sender);
+                    }
+                    Err(error) => self.toast(&format!("{} failed: {error}", action.label())),
+                }
             }
         }
     }
