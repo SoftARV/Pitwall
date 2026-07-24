@@ -5,10 +5,13 @@
 //! rule 4).
 //!
 //! Mapping octocrab's models into ours here keeps the components and the `view!`
-//! macros free of octocrab entirely. So far: the rate-limit snapshot and `Repo`;
-//! the `WorkflowRun` / `Job` / `Step` types arrive with the run list.
+//! macros free of octocrab entirely: `RateLimit`, `Repo`, and the run trio
+//! (`WorkflowRun` / `RunStatus` / `Conclusion`). Jobs and steps arrive with the
+//! detail page.
 
+use chrono::{DateTime, Utc};
 use octocrab::models::Repository;
+use octocrab::models::workflows::Run;
 
 /// A snapshot of the authenticated **core** rate-limit budget.
 ///
@@ -49,6 +52,113 @@ impl Repo {
     }
 }
 
+/// Where a run is in its lifecycle. GitHub's `status` string, narrowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStatus {
+    Queued,
+    InProgress,
+    Completed,
+    /// A status string we don't recognise — surfaced as-is rather than guessed.
+    Unknown,
+}
+
+impl RunStatus {
+    fn from_api(status: &str) -> Self {
+        match status {
+            "queued" | "pending" | "waiting" | "requested" => RunStatus::Queued,
+            "in_progress" => RunStatus::InProgress,
+            "completed" => RunStatus::Completed,
+            _ => RunStatus::Unknown,
+        }
+    }
+
+    /// A run still doing work — the poll should stay attentive to these (adaptive
+    /// polling, later), and the header counts them as "running".
+    pub fn is_active(self) -> bool {
+        matches!(self, RunStatus::Queued | RunStatus::InProgress)
+    }
+}
+
+/// How a completed run turned out. `None` on a `WorkflowRun` means "not completed
+/// yet" (GitHub sends `conclusion: null` until then).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Conclusion {
+    Success,
+    Failure,
+    Cancelled,
+    Skipped,
+    TimedOut,
+    ActionRequired,
+    Neutral,
+    StartupFailure,
+    Stale,
+    Unknown,
+}
+
+impl Conclusion {
+    fn from_api(conclusion: &str) -> Self {
+        match conclusion {
+            "success" => Conclusion::Success,
+            "failure" => Conclusion::Failure,
+            "cancelled" => Conclusion::Cancelled,
+            "skipped" => Conclusion::Skipped,
+            "timed_out" => Conclusion::TimedOut,
+            "action_required" => Conclusion::ActionRequired,
+            "neutral" => Conclusion::Neutral,
+            "startup_failure" => Conclusion::StartupFailure,
+            "stale" => Conclusion::Stale,
+            _ => Conclusion::Unknown,
+        }
+    }
+
+    /// A red, went-wrong outcome — what a failure notification keys off, and what
+    /// the header counts as "failing".
+    pub fn is_failure(self) -> bool {
+        matches!(
+            self,
+            Conclusion::Failure | Conclusion::TimedOut | Conclusion::StartupFailure
+        )
+    }
+}
+
+/// One workflow run, the unit the list shows. octocrab's `Run` stops here.
+#[derive(Debug, Clone)]
+pub struct WorkflowRun {
+    /// GitHub's run id — the stable key the list reconciles on.
+    pub id: u64,
+    pub run_number: i64,
+    /// The workflow's name, e.g. "CI".
+    pub workflow_name: String,
+    /// `owner/name` of the repo this run belongs to.
+    pub repo: String,
+    pub head_branch: String,
+    pub event: String,
+    pub status: RunStatus,
+    pub conclusion: Option<Conclusion>,
+    pub created_at: DateTime<Utc>,
+    /// The run's page on github.com — for "open in browser".
+    pub html_url: String,
+}
+
+impl WorkflowRun {
+    /// Narrow octocrab's `Run`. `repo` is the `owner/name` the caller queried —
+    /// authoritative, and saves trusting the model's optional repository block.
+    pub fn from_model(run: Run, repo: String) -> Self {
+        Self {
+            id: run.id.into_inner(),
+            run_number: run.run_number,
+            workflow_name: run.name,
+            repo,
+            head_branch: run.head_branch,
+            event: run.event,
+            status: RunStatus::from_api(&run.status),
+            conclusion: run.conclusion.as_deref().map(Conclusion::from_api),
+            created_at: run.created_at,
+            html_url: run.html_url.to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -61,5 +171,27 @@ mod tests {
             private: true,
         };
         assert_eq!(repo.full_name(), "SoftARV/Pitwall");
+    }
+
+    #[test]
+    fn run_status_maps_the_api_strings() {
+        assert_eq!(RunStatus::from_api("queued"), RunStatus::Queued);
+        assert_eq!(RunStatus::from_api("waiting"), RunStatus::Queued);
+        assert_eq!(RunStatus::from_api("in_progress"), RunStatus::InProgress);
+        assert_eq!(RunStatus::from_api("completed"), RunStatus::Completed);
+        assert_eq!(RunStatus::from_api("nonsense"), RunStatus::Unknown);
+        assert!(RunStatus::InProgress.is_active());
+        assert!(!RunStatus::Completed.is_active());
+    }
+
+    #[test]
+    fn conclusion_maps_and_flags_failures() {
+        assert_eq!(Conclusion::from_api("success"), Conclusion::Success);
+        assert_eq!(Conclusion::from_api("timed_out"), Conclusion::TimedOut);
+        assert_eq!(Conclusion::from_api("nonsense"), Conclusion::Unknown);
+        assert!(Conclusion::Failure.is_failure());
+        assert!(Conclusion::TimedOut.is_failure());
+        assert!(!Conclusion::Success.is_failure());
+        assert!(!Conclusion::Cancelled.is_failure());
     }
 }

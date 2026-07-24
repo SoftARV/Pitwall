@@ -17,14 +17,17 @@
 use futures_util::FutureExt;
 use relm4::actions::{AccelsPlus, RelmAction, RelmActionGroup};
 use relm4::adw::prelude::*;
-use relm4::gtk::gio;
+use relm4::factory::FactoryVecDeque;
+use relm4::gtk::{gio, glib};
 use relm4::{
     Component, ComponentController, ComponentParts, ComponentSender, Controller, RelmWidgetExt,
     adw, gtk,
 };
 
 use crate::components::repo_picker::{RepoPicker, RepoPickerInit, RepoPickerOutput};
+use crate::components::run_row::{RunRow, RunRowInput, RunRowOutput};
 use crate::github::client::{self, ConnectError, Connection};
+use crate::github::types::{Conclusion, WorkflowRun};
 use crate::secret;
 use crate::settings::Settings;
 
@@ -33,10 +36,16 @@ use crate::settings::Settings;
 // `win.about`). The group is registered on the window in `init`, where each
 // action bridges to an `AppMsg` (except Quit, which acts directly).
 relm4::new_action_group!(AppMenuActionGroup, "win");
+relm4::new_stateless_action!(RefreshAction, AppMenuActionGroup, "refresh");
 relm4::new_stateless_action!(EditWatchlistAction, AppMenuActionGroup, "edit-watchlist");
 relm4::new_stateless_action!(SignOutAction, AppMenuActionGroup, "sign-out");
 relm4::new_stateless_action!(AboutAction, AppMenuActionGroup, "about");
 relm4::new_stateless_action!(QuitAction, AppMenuActionGroup, "quit");
+
+/// Poll interval for the run list. 45s is CLAUDE.md's default; the timer is
+/// removed entirely while the window is hidden (rule 3), so a backgrounded
+/// Pitwall costs nothing against the rate budget.
+const POLL_INTERVAL_SECS: u32 = 45;
 
 // The one bit of custom CSS: a black "Sign in with GitHub" button, so it's
 // instantly recognisable and stands out on the modal (the earlier grey blended
@@ -100,11 +109,25 @@ pub struct AppModel {
     repo_picker: Option<Controller<RepoPicker>>,
     /// The watched repos as `owner/name`, mirrored from settings for the view.
     watched: Vec<String>,
-    /// The "Sign Out" and "Edit Watchlist" menu actions — both
+    /// The visible run rows, reconciled in place from `all_runs` (rule 7).
+    runs: FactoryVecDeque<RunRow>,
+    /// The full run set from the last poll — what the header count and the
+    /// reconcile read.
+    all_runs: Vec<WorkflowRun>,
+    /// Whether a poll has landed since connecting: tells "still loading" apart
+    /// from "genuinely no runs".
+    runs_loaded: bool,
+    /// A refresh the user asked for (menu / Ctrl+R): shows the header spinner.
+    /// The background poll is silent.
+    refreshing: bool,
+    /// The poll timer, while running. Removed outright when the window is hidden.
+    poll: Option<glib::SourceId>,
+    /// The "Sign Out", "Edit Watchlist", and "Refresh" menu actions — all
     /// `hidden-when="action-disabled"`, so they show (and act) only when signed
     /// in; disabling *hides* them rather than greying them.
     signout_action: gio::SimpleAction,
     editwatch_action: gio::SimpleAction,
+    refresh_action: gio::SimpleAction,
     settings: Settings,
 }
 
@@ -126,6 +149,14 @@ pub enum AppMsg {
     WatchlistSaved(Vec<String>),
     /// "Try Again" on the disconnected page — re-run the startup connect.
     Retry,
+    /// The background poll tick (silent) — reload the runs.
+    Refresh,
+    /// A user-triggered refresh (menu / Ctrl+R): reload, and spin the header.
+    ManualRefresh,
+    /// Open a run on github.com (a row was activated).
+    OpenInBrowser(String),
+    /// The window became visible / hidden — gates the poll (rule 3).
+    SuspendedChanged(bool),
     /// Open the About dialog (primary menu).
     ShowAbout,
 }
@@ -152,6 +183,10 @@ pub enum CommandMsg {
         generation: u64,
         result: Box<Result<Connection, ConnectError>>,
     },
+    /// A poll returned the runs across the watched repos.
+    RunsLoaded(Vec<WorkflowRun>),
+    /// A poll failed for every watched repo (offline / bad token).
+    RunsFailed(String),
 }
 
 impl AppModel {
@@ -165,12 +200,37 @@ impl AppModel {
         }
     }
 
-    /// The header subtitle: who we're signed in as, once connected. Empty
-    /// otherwise, so `adw::WindowTitle` hides the subtitle line.
+    fn toast(&self, message: &str) {
+        self.toast_overlay.add_toast(adw::Toast::new(message));
+    }
+
+    /// The header subtitle: a live run summary once runs have loaded, else who
+    /// we're signed in as. Empty when disconnected, so the subtitle line hides.
     fn header_subtitle(&self) -> String {
-        match &self.connection {
-            Some(connection) => format!("Signed in as {}", connection.login),
-            None => String::new(),
+        if matches!(self.state, ViewState::Ready) && self.runs_loaded && !self.all_runs.is_empty() {
+            let total = self.all_runs.len();
+            let failing = self
+                .all_runs
+                .iter()
+                .filter(|run| run.conclusion.is_some_and(Conclusion::is_failure))
+                .count();
+            let running = self
+                .all_runs
+                .iter()
+                .filter(|run| run.status.is_active())
+                .count();
+            let mut parts = vec![format!("{total} run{}", if total == 1 { "" } else { "s" })];
+            if failing > 0 {
+                parts.push(format!("{failing} failing"));
+            }
+            if running > 0 {
+                parts.push(format!("{running} running"));
+            }
+            parts.join(" · ")
+        } else if let Some(connection) = &self.connection {
+            format!("Signed in as {}", connection.login)
+        } else {
+            String::new()
         }
     }
 
@@ -179,36 +239,90 @@ impl AppModel {
     fn set_signed_in(&self, signed_in: bool) {
         self.signout_action.set_enabled(signed_in);
         self.editwatch_action.set_enabled(signed_in);
+        self.refresh_action.set_enabled(signed_in);
     }
 
-    /// The "app" page title — whether any repos are watched yet.
-    fn app_title(&self) -> &'static str {
+    /// Which `app` sub-page to show: no repos, first-load spinner, no runs, or
+    /// the list.
+    fn app_page(&self) -> &'static str {
         if self.watched.is_empty() {
-            "No repositories watched"
+            "no-repos"
+        } else if !self.runs_loaded {
+            "loading"
+        } else if self.all_runs.is_empty() {
+            "no-runs"
         } else {
-            "Watching your repositories"
+            "runs"
         }
     }
 
-    /// The "app" page description. A placeholder summary of the watch set; the
-    /// run list replaces this next milestone.
-    fn app_description(&self) -> String {
+    /// Start the poll, unless it's already running or there's nothing to poll.
+    /// Idempotent, so a `SuspendedChanged(false)` arriving while it already runs
+    /// doesn't stack a second timer.
+    fn start_poll(&mut self, sender: &ComponentSender<Self>) {
+        if self.poll.is_some() || self.connection.is_none() || self.watched.is_empty() {
+            return;
+        }
+        let input = sender.input_sender().clone();
+        self.poll = Some(glib::timeout_add_seconds_local(
+            POLL_INTERVAL_SECS,
+            move || {
+                input.send(AppMsg::Refresh).ok();
+                glib::ControlFlow::Continue
+            },
+        ));
+    }
+
+    /// Remove the poll timer entirely, so it stops waking the CPU (and network).
+    /// `take()` matters: removing a `SourceId` twice is a glib programmer error.
+    fn stop_poll(&mut self) {
+        if let Some(source) = self.poll.take() {
+            source.remove();
+        }
+    }
+
+    /// Fire off a run-list fetch across the watched repos, off-thread.
+    fn dispatch_refresh(&self, sender: &ComponentSender<Self>) {
+        let Some(connection) = &self.connection else {
+            return;
+        };
         if self.watched.is_empty() {
-            "Add the repositories whose Actions you want to keep an eye on.".to_owned()
-        } else {
-            match self.watched.len() {
-                1 => self.watched[0].clone(),
-                n => format!("Watching {n} repositories: {}", self.watched.join(", ")),
+            return;
+        }
+        // `Octocrab` is Arc-backed, so this clone is a pointer bump — and the
+        // command needs `'static + Send` data it owns, not a borrow of `self`.
+        let octocrab = connection.octocrab.clone();
+        let repos = self.watched.clone();
+        sender.oneshot_command(async move {
+            match client::list_runs(&octocrab, &repos).await {
+                Ok(runs) => CommandMsg::RunsLoaded(runs),
+                Err(reason) => CommandMsg::RunsFailed(reason),
             }
-        }
+        });
     }
 
-    /// The watchlist button's label — "add" the first time, "edit" thereafter.
-    fn watchlist_button_label(&self) -> &'static str {
-        if self.watched.is_empty() {
-            "Add Repositories"
+    /// Reconcile the visible rows from `all_runs`: update in place while the id
+    /// set is unchanged, rebuild only when membership changes (rule 7). The clone
+    /// avoids a simultaneous borrow of `self.all_runs` and `self.runs`.
+    fn apply_runs(&mut self) {
+        let target = self.all_runs.clone();
+        let unchanged = self.runs.len() == target.len()
+            && self
+                .runs
+                .iter()
+                .zip(&target)
+                .all(|(row, run)| row.id() == run.id);
+
+        if unchanged {
+            for (index, run) in target.into_iter().enumerate() {
+                self.runs.send(index, RunRowInput::Update(run));
+            }
         } else {
-            "Edit Watchlist"
+            let mut guard = self.runs.guard();
+            guard.clear();
+            for run in target {
+                guard.push_back(run);
+            }
         }
     }
 
@@ -369,15 +483,20 @@ impl AppModel {
         self.set_signed_in(false);
     }
 
-    /// Close the modal (if any) and move to the connected app.
-    fn go_ready(&mut self, connection: Connection) {
+    /// Close the modal (if any), move to the connected app, and start polling.
+    fn go_ready(&mut self, connection: Connection, sender: &ComponentSender<Self>) {
         if let Some(onboarding) = self.onboarding.take() {
             onboarding.dialog.force_close();
         }
         self.connection = Some(connection);
         self.state = ViewState::Ready;
         self.device = None;
+        self.runs_loaded = false;
         self.set_signed_in(true);
+        // A fresh connection: poll now and on the interval (both no-op if the
+        // watch list is empty).
+        self.start_poll(sender);
+        self.dispatch_refresh(sender);
     }
 
     /// Load a saved token off-thread and, if there is one, build and verify a
@@ -427,6 +546,16 @@ impl Component for AppModel {
                             set_icon_name: "open-menu-symbolic",
                             set_tooltip_text: Some("Main Menu"),
                         },
+
+                        // Spins only for a refresh the user asked for; the
+                        // background poll is silent.
+                        pack_end = &gtk::Spinner {
+                            #[watch]
+                            set_visible: model.refreshing,
+                            #[watch]
+                            set_spinning: model.refreshing,
+                            set_valign: gtk::Align::Center,
+                        },
                     },
 
                     // One page per state. Onboarding (sign-in) is a modal over
@@ -451,25 +580,61 @@ impl Component for AppModel {
                             set_description: Some("Sign in to start monitoring your workflow runs."),
                         },
 
-                        add_named[Some("app")] = &adw::StatusPage {
-                            set_icon_name: Some("view-list-symbolic"),
-                            #[watch]
-                            set_title: model.app_title(),
-                            #[watch]
-                            set_description: Some(&model.app_description()),
+                        // The connected app: a nested stack over the run list.
+                        add_named[Some("app")] = &gtk::Stack {
+                            add_named[Some("no-repos")] = &adw::StatusPage {
+                                set_icon_name: Some("view-list-symbolic"),
+                                set_title: "No repositories watched",
+                                set_description: Some(
+                                    "Add the repositories whose Actions you want to keep an eye on.",
+                                ),
 
-                            #[wrap(Some)]
-                            set_child = &gtk::Box {
-                                set_halign: gtk::Align::Center,
+                                #[wrap(Some)]
+                                set_child = &gtk::Box {
+                                    set_halign: gtk::Align::Center,
 
-                                #[name = "watchlist_button"]
-                                gtk::Button {
-                                    #[watch]
-                                    set_label: model.watchlist_button_label(),
-                                    add_css_class: "pill",
-                                    add_css_class: "suggested-action",
+                                    #[name = "watchlist_button"]
+                                    gtk::Button {
+                                        set_label: "Add Repositories",
+                                        add_css_class: "pill",
+                                        add_css_class: "suggested-action",
+                                    },
                                 },
                             },
+
+                            add_named[Some("loading")] = &gtk::Box {
+                                set_orientation: gtk::Orientation::Vertical,
+                                set_valign: gtk::Align::Center,
+                                set_halign: gtk::Align::Center,
+                                gtk::Spinner {
+                                    set_spinning: true,
+                                    set_size_request: (32, 32),
+                                },
+                            },
+
+                            add_named[Some("no-runs")] = &adw::StatusPage {
+                                set_icon_name: Some("view-refresh-symbolic"),
+                                set_title: "No runs yet",
+                                set_description: Some(
+                                    "Workflow runs in your watched repositories will appear here.",
+                                ),
+                            },
+
+                            add_named[Some("runs")] = &gtk::ScrolledWindow {
+                                set_vexpand: true,
+
+                                adw::Clamp {
+                                    set_maximum_size: 700,
+                                    set_tightening_threshold: 500,
+                                    set_margin_all: 12,
+
+                                    #[local_ref]
+                                    runs_group -> adw::PreferencesGroup {},
+                                },
+                            },
+
+                            #[watch]
+                            set_visible_child_name: model.app_page(),
                         },
 
                         add_named[Some("disconnected")] = &adw::StatusPage {
@@ -520,6 +685,22 @@ impl Component for AppModel {
             })
         };
         editwatch_action.set_enabled(false);
+        let refresh_action: RelmAction<RefreshAction> = {
+            let sender = sender.input_sender().clone();
+            RelmAction::new_stateless(move |_| {
+                sender.send(AppMsg::ManualRefresh).ok();
+            })
+        };
+        refresh_action.set_enabled(false);
+
+        // The run rows live directly on the model (no `run_list.rs` wrapper —
+        // it'd be one field's worth of indirection). Rows emit an intent; the
+        // reducer decides.
+        let runs = FactoryVecDeque::builder()
+            .launch(adw::PreferencesGroup::default())
+            .forward(sender.input_sender(), |output| match output {
+                RunRowOutput::OpenInBrowser(url) => AppMsg::OpenInBrowser(url),
+            });
 
         let model = AppModel {
             connection: None,
@@ -530,18 +711,30 @@ impl Component for AppModel {
             toast_overlay: adw::ToastOverlay::new(),
             onboarding: None,
             repo_picker: None,
+            runs,
+            all_runs: Vec::new(),
+            runs_loaded: false,
+            refreshing: false,
+            poll: None,
             signout_action: signout_action.gio_action().clone(),
             editwatch_action: editwatch_action.gio_action().clone(),
+            refresh_action: refresh_action.gio_action().clone(),
             settings,
         };
 
         let toast_overlay = model.toast_overlay.clone();
+        let runs_group = model.runs.widget();
 
         let widgets = view_output!();
 
         // The primary menu, built by hand so Sign Out can carry the `hidden-when`
         // attribute the `menu!` macro doesn't expose.
         let menu = gio::Menu::new();
+        let refresh_section = gio::Menu::new();
+        let refresh_item = gio::MenuItem::new(Some("Refresh"), Some("win.refresh"));
+        refresh_item.set_attribute_value("hidden-when", Some(&"action-disabled".to_variant()));
+        refresh_section.append_item(&refresh_item);
+        menu.append_section(None, &refresh_section);
         let account = gio::Menu::new();
         let edit_item = gio::MenuItem::new(Some("Edit Watchlist"), Some("win.edit-watchlist"));
         edit_item.set_attribute_value("hidden-when", Some(&"action-disabled".to_variant()));
@@ -578,11 +771,25 @@ impl Component for AppModel {
         let mut group = RelmActionGroup::<AppMenuActionGroup>::new();
         group.add_action(signout_action);
         group.add_action(editwatch_action);
+        group.add_action(refresh_action);
         group.add_action(about_action);
         group.add_action(quit_action);
         group.register_for_widget(&root);
 
-        relm4::main_application().set_accelerators_for_action::<QuitAction>(&["<primary>q"]);
+        let app = relm4::main_application();
+        app.set_accelerators_for_action::<QuitAction>(&["<primary>q"]);
+        app.set_accelerators_for_action::<RefreshAction>(&["<primary>r", "F5"]);
+
+        // Let GTK tell us when the window isn't worth polling for — minimised,
+        // fully obscured, or on another workspace all count as "suspended".
+        // Wired here (not once connected) because a reconnect runs this path
+        // again; `start_poll` already no-ops while disconnected.
+        let suspended = sender.input_sender().clone();
+        root.connect_suspended_notify(move |window| {
+            suspended
+                .send(AppMsg::SuspendedChanged(window.is_suspended()))
+                .ok();
+        });
 
         // Reading the keyring and connecting both touch I/O, so they can't happen
         // inline in `init` — kick them off as a command.
@@ -707,6 +914,36 @@ impl Component for AppModel {
                 self.settings.save();
                 // The dialog closed itself on Save; drop its controller.
                 self.repo_picker = None;
+                // The watch set changed: clear the old runs and re-poll from
+                // scratch (both no-op if the set is now empty → the no-repos page).
+                self.all_runs.clear();
+                self.runs.guard().clear();
+                self.runs_loaded = false;
+                self.stop_poll();
+                self.start_poll(&sender);
+                self.dispatch_refresh(&sender);
+            }
+
+            AppMsg::Refresh => self.dispatch_refresh(&sender),
+
+            AppMsg::ManualRefresh => {
+                self.refreshing = true;
+                self.dispatch_refresh(&sender);
+            }
+
+            AppMsg::OpenInBrowser(url) => Self::open_uri(&url, root),
+
+            AppMsg::SuspendedChanged(suspended) => {
+                if suspended {
+                    self.stop_poll();
+                } else {
+                    self.start_poll(&sender);
+                    // Whatever we last drew is as stale as the pause was long, so
+                    // refresh now rather than waiting for the first tick.
+                    if matches!(self.state, ViewState::Ready) {
+                        self.dispatch_refresh(&sender);
+                    }
+                }
             }
 
             AppMsg::Retry => {
@@ -748,7 +985,7 @@ impl Component for AppModel {
             CommandMsg::Connected(result) => match *result {
                 Ok(connection) => {
                     tracing::debug!(login = %connection.login, "connected");
-                    self.go_ready(connection);
+                    self.go_ready(connection, &sender);
                 }
                 Err(err) => {
                     if err.is_auth() {
@@ -808,7 +1045,7 @@ impl Component for AppModel {
                 match *result {
                     Ok(connection) => {
                         tracing::debug!(login = %connection.login, "signed in");
-                        self.go_ready(connection);
+                        self.go_ready(connection, &sender);
                     }
                     Err(err) => {
                         // Denied, timed out, or a blip after authorising: back to
@@ -820,6 +1057,26 @@ impl Component for AppModel {
                                 .add_toast(adw::Toast::new(err.message()));
                         }
                     }
+                }
+            }
+
+            CommandMsg::RunsLoaded(runs) => {
+                self.all_runs = runs;
+                self.runs_loaded = true;
+                self.refreshing = false;
+                self.apply_runs();
+            }
+
+            CommandMsg::RunsFailed(reason) => {
+                self.refreshing = false;
+                if self.runs_loaded {
+                    // We already have runs; a transient failure shouldn't wipe
+                    // them — keep the last set and just say so.
+                    self.toast(&format!("Couldn't refresh: {reason}"));
+                } else {
+                    // Never loaded and every repo failed: treat it as offline.
+                    self.stop_poll();
+                    self.state = ViewState::Disconnected(reason);
                 }
             }
         }
