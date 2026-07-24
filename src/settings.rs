@@ -5,14 +5,13 @@
 //!
 //! A small INI file in the XDG config dir (`~/.config/pitwall/settings.ini`),
 //! read through `glib::KeyFile`. Deliberately *not* GSettings — that needs a
-//! compiled schema installed before the app will even start, which breaks
+//! compiled schema installed before the app will even start, breaking
 //! `cargo run` — and, per CLAUDE.md rule 2, deliberately *not* where the GitHub
 //! token goes: the token is a secret and lives in the keyring (`secret.rs`),
 //! never here.
 //!
-//! For now this holds only the theme; later milestones grow it with the watched
-//! repo list, the poll interval, and notification preferences (and a `save()`
-//! once something actually edits a preference).
+//! Holds the theme and the watched-repo list; later milestones add the poll
+//! interval and notification preferences.
 
 use std::path::PathBuf;
 
@@ -40,6 +39,15 @@ impl Theme {
         }
     }
 
+    /// The stable string written to the config file.
+    fn as_key(self) -> &'static str {
+        match self {
+            Theme::System => "system",
+            Theme::Light => "light",
+            Theme::Dark => "dark",
+        }
+    }
+
     fn from_key(key: &str) -> Self {
         match key {
             "light" => Theme::Light,
@@ -49,10 +57,13 @@ impl Theme {
     }
 }
 
-/// The app's global settings. Loaded once at startup.
+/// The app's global settings. Loaded once at startup, saved on every change.
 #[derive(Debug, Clone, Default)]
 pub struct Settings {
     pub theme: Theme,
+    /// The hand-picked repos to monitor, as `"owner/name"`. Empty until the user
+    /// adds some via the repo picker.
+    pub watched: Vec<String>,
 }
 
 impl Settings {
@@ -73,8 +84,37 @@ impl Settings {
         if let Ok(theme) = keyfile.string("appearance", "theme") {
             settings.theme = Theme::from_key(&theme);
         }
+        // Stored comma-joined. A repo full name is `owner/name` and can't contain
+        // a comma, so a plain split round-trips exactly; the empty-string filter
+        // turns "" (no repos) back into an empty list rather than `[""]`.
+        if let Ok(repos) = keyfile.string("watchlist", "repos") {
+            settings.watched = repos
+                .split(',')
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect();
+        }
 
         settings
+    }
+
+    /// Write to disk, creating the config directory if needed. Failures are
+    /// logged, not fatal — losing a preference isn't worth crashing over.
+    pub fn save(&self) {
+        let keyfile = glib::KeyFile::new();
+        keyfile.set_string("appearance", "theme", self.theme.as_key());
+        keyfile.set_string("watchlist", "repos", &self.watched.join(","));
+
+        let path = config_path();
+        if let Some(dir) = path.parent()
+            && let Err(err) = std::fs::create_dir_all(dir)
+        {
+            tracing::warn!(%err, "couldn't create the config directory");
+            return;
+        }
+        if let Err(err) = keyfile.save_to_file(&path) {
+            tracing::warn!(%err, "couldn't save settings");
+        }
     }
 
     /// Apply the theme to the whole app, globally via `adw::StyleManager`. Call

@@ -18,8 +18,12 @@ use futures_util::FutureExt;
 use relm4::actions::{AccelsPlus, RelmAction, RelmActionGroup};
 use relm4::adw::prelude::*;
 use relm4::gtk::gio;
-use relm4::{Component, ComponentParts, ComponentSender, RelmWidgetExt, adw, gtk};
+use relm4::{
+    Component, ComponentController, ComponentParts, ComponentSender, Controller, RelmWidgetExt,
+    adw, gtk,
+};
 
+use crate::components::repo_picker::{RepoPicker, RepoPickerInit, RepoPickerOutput};
 use crate::github::client::{self, ConnectError, Connection};
 use crate::secret;
 use crate::settings::Settings;
@@ -29,6 +33,7 @@ use crate::settings::Settings;
 // `win.about`). The group is registered on the window in `init`, where each
 // action bridges to an `AppMsg` (except Quit, which acts directly).
 relm4::new_action_group!(AppMenuActionGroup, "win");
+relm4::new_stateless_action!(EditWatchlistAction, AppMenuActionGroup, "edit-watchlist");
 relm4::new_stateless_action!(SignOutAction, AppMenuActionGroup, "sign-out");
 relm4::new_stateless_action!(AboutAction, AppMenuActionGroup, "about");
 relm4::new_stateless_action!(QuitAction, AppMenuActionGroup, "quit");
@@ -91,11 +96,15 @@ pub struct AppModel {
     toast_overlay: adw::ToastOverlay,
     /// The onboarding modal, while it's shown.
     onboarding: Option<Onboarding>,
-    /// The "Sign Out" menu action. Disabled unless signed in — and the menu item
-    /// is `hidden-when="action-disabled"`, so disabling it *hides* it (rather
-    /// than greying it), which is what "only show Sign Out when signed in" needs.
+    /// The repo picker dialog, while it's open.
+    repo_picker: Option<Controller<RepoPicker>>,
+    /// The watched repos as `owner/name`, mirrored from settings for the view.
+    watched: Vec<String>,
+    /// The "Sign Out" and "Edit Watchlist" menu actions — both
+    /// `hidden-when="action-disabled"`, so they show (and act) only when signed
+    /// in; disabling *hides* them rather than greying them.
     signout_action: gio::SimpleAction,
-    #[allow(dead_code)]
+    editwatch_action: gio::SimpleAction,
     settings: Settings,
 }
 
@@ -111,6 +120,10 @@ pub enum AppMsg {
     CancelAuth,
     /// "Sign Out" — forget the token and return to onboarding.
     SignOut,
+    /// Open the repo picker (menu item or empty-state button).
+    EditWatchlist,
+    /// The picker saved a new watch set.
+    WatchlistSaved(Vec<String>),
     /// "Try Again" on the disconnected page — re-run the startup connect.
     Retry,
     /// Open the About dialog (primary menu).
@@ -161,14 +174,41 @@ impl AppModel {
         }
     }
 
-    /// The "app" page's description: the login plus the remaining rate budget.
-    fn ready_description(&self) -> String {
-        match &self.connection {
-            Some(connection) => format!(
-                "Signed in as {}. {} of {} API requests remaining this hour.",
-                connection.login, connection.rate.remaining, connection.rate.limit,
-            ),
-            None => String::new(),
+    /// Enable (or disable) the signed-in-only menu actions together. Disabled
+    /// means hidden, via each item's `hidden-when="action-disabled"`.
+    fn set_signed_in(&self, signed_in: bool) {
+        self.signout_action.set_enabled(signed_in);
+        self.editwatch_action.set_enabled(signed_in);
+    }
+
+    /// The "app" page title — whether any repos are watched yet.
+    fn app_title(&self) -> &'static str {
+        if self.watched.is_empty() {
+            "No repositories watched"
+        } else {
+            "Watching your repositories"
+        }
+    }
+
+    /// The "app" page description. A placeholder summary of the watch set; the
+    /// run list replaces this next milestone.
+    fn app_description(&self) -> String {
+        if self.watched.is_empty() {
+            "Add the repositories whose Actions you want to keep an eye on.".to_owned()
+        } else {
+            match self.watched.len() {
+                1 => self.watched[0].clone(),
+                n => format!("Watching {n} repositories: {}", self.watched.join(", ")),
+            }
+        }
+    }
+
+    /// The watchlist button's label — "add" the first time, "edit" thereafter.
+    fn watchlist_button_label(&self) -> &'static str {
+        if self.watched.is_empty() {
+            "Add Repositories"
+        } else {
+            "Edit Watchlist"
         }
     }
 
@@ -326,7 +366,7 @@ impl AppModel {
         }
         self.state = ViewState::SignedOut;
         self.device = None;
-        self.signout_action.set_enabled(false);
+        self.set_signed_in(false);
     }
 
     /// Close the modal (if any) and move to the connected app.
@@ -337,7 +377,7 @@ impl AppModel {
         self.connection = Some(connection);
         self.state = ViewState::Ready;
         self.device = None;
-        self.signout_action.set_enabled(true);
+        self.set_signed_in(true);
     }
 
     /// Load a saved token off-thread and, if there is one, build and verify a
@@ -412,10 +452,24 @@ impl Component for AppModel {
                         },
 
                         add_named[Some("app")] = &adw::StatusPage {
-                            set_icon_name: Some("emblem-ok-symbolic"),
-                            set_title: "Connected to GitHub",
+                            set_icon_name: Some("view-list-symbolic"),
                             #[watch]
-                            set_description: Some(&model.ready_description()),
+                            set_title: model.app_title(),
+                            #[watch]
+                            set_description: Some(&model.app_description()),
+
+                            #[wrap(Some)]
+                            set_child = &gtk::Box {
+                                set_halign: gtk::Align::Center,
+
+                                #[name = "watchlist_button"]
+                                gtk::Button {
+                                    #[watch]
+                                    set_label: model.watchlist_button_label(),
+                                    add_css_class: "pill",
+                                    add_css_class: "suggested-action",
+                                },
+                            },
                         },
 
                         add_named[Some("disconnected")] = &adw::StatusPage {
@@ -459,15 +513,25 @@ impl Component for AppModel {
             })
         };
         signout_action.set_enabled(false);
+        let editwatch_action: RelmAction<EditWatchlistAction> = {
+            let sender = sender.input_sender().clone();
+            RelmAction::new_stateless(move |_| {
+                sender.send(AppMsg::EditWatchlist).ok();
+            })
+        };
+        editwatch_action.set_enabled(false);
 
         let model = AppModel {
             connection: None,
             state: ViewState::Loading,
+            watched: settings.watched.clone(),
             device: None,
             auth_gen: 0,
             toast_overlay: adw::ToastOverlay::new(),
             onboarding: None,
+            repo_picker: None,
             signout_action: signout_action.gio_action().clone(),
+            editwatch_action: editwatch_action.gio_action().clone(),
             settings,
         };
 
@@ -479,6 +543,9 @@ impl Component for AppModel {
         // attribute the `menu!` macro doesn't expose.
         let menu = gio::Menu::new();
         let account = gio::Menu::new();
+        let edit_item = gio::MenuItem::new(Some("Edit Watchlist"), Some("win.edit-watchlist"));
+        edit_item.set_attribute_value("hidden-when", Some(&"action-disabled".to_variant()));
+        account.append_item(&edit_item);
         let signout_item = gio::MenuItem::new(Some("Sign Out"), Some("win.sign-out"));
         signout_item.set_attribute_value("hidden-when", Some(&"action-disabled".to_variant()));
         account.append_item(&signout_item);
@@ -494,6 +561,11 @@ impl Component for AppModel {
             retry_sender.send(AppMsg::Retry).ok();
         });
 
+        let watchlist_sender = sender.input_sender().clone();
+        widgets.watchlist_button.connect_clicked(move |_| {
+            watchlist_sender.send(AppMsg::EditWatchlist).ok();
+        });
+
         // Menu actions — thin bridges to `AppMsg` (Quit acts directly).
         let about_sender = sender.input_sender().clone();
         let about_action: RelmAction<AboutAction> = RelmAction::new_stateless(move |_| {
@@ -505,6 +577,7 @@ impl Component for AppModel {
 
         let mut group = RelmActionGroup::<AppMenuActionGroup>::new();
         group.add_action(signout_action);
+        group.add_action(editwatch_action);
         group.add_action(about_action);
         group.add_action(quit_action);
         group.register_for_widget(&root);
@@ -609,6 +682,33 @@ impl Component for AppModel {
                 });
             }
 
+            AppMsg::EditWatchlist => {
+                let Some(connection) = &self.connection else {
+                    return;
+                };
+                // The picker fetches and lists the repos itself; we hand it the
+                // client (a cheap Arc clone) and the current watch set to pre-tick,
+                // and forward its Saved output back as a message.
+                let controller = RepoPicker::builder()
+                    .launch(RepoPickerInit {
+                        octocrab: connection.octocrab.clone(),
+                        watched: self.watched.clone(),
+                    })
+                    .forward(sender.input_sender(), |output| match output {
+                        RepoPickerOutput::Saved(names) => AppMsg::WatchlistSaved(names),
+                    });
+                controller.widget().present(Some(root));
+                self.repo_picker = Some(controller);
+            }
+
+            AppMsg::WatchlistSaved(names) => {
+                self.watched.clone_from(&names);
+                self.settings.watched = names;
+                self.settings.save();
+                // The dialog closed itself on Save; drop its controller.
+                self.repo_picker = None;
+            }
+
             AppMsg::Retry => {
                 self.state = ViewState::Loading;
                 Self::dispatch_boot(&sender);
@@ -625,6 +725,13 @@ impl Component for AppModel {
                     .issue_url("https://github.com/SoftARV/Pitwall/issues")
                     .license_type(gtk::License::Gpl30)
                     .copyright("© 2026 Miguel Rincon")
+                    .debug_info(match &self.connection {
+                        Some(connection) => format!(
+                            "Signed in as {}\nRate limit: {} / {} requests remaining this hour",
+                            connection.login, connection.rate.remaining, connection.rate.limit,
+                        ),
+                        None => "Not connected".to_owned(),
+                    })
                     .build();
                 about.present(Some(root));
             }
@@ -660,7 +767,7 @@ impl Component for AppModel {
                         }
                         self.connection = None;
                         self.state = ViewState::Disconnected(err.message().to_owned());
-                        self.signout_action.set_enabled(false);
+                        self.set_signed_in(false);
                     }
                 }
             },

@@ -11,7 +11,7 @@ use http::header::ACCEPT;
 use octocrab::Octocrab;
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::github::types::RateLimit;
+use crate::github::types::{RateLimit, Repo};
 
 /// The OAuth App's **public** client id. Device flow needs no secret, and every
 /// device-flow client ships its id in the binary (gh's is public too), so
@@ -31,9 +31,8 @@ const SCOPES: [&str; 1] = ["repo"];
 /// poll will need from the run-list milestone on, because an async task must
 /// own `'static` data and so can't borrow `&self`.
 pub struct Connection {
-    // Held for the poll (from the run-list milestone on). Not read yet, hence
-    // the allow — it's the client every future request goes through.
-    #[allow(dead_code)]
+    /// The client every request goes through — cloned (a cheap Arc bump) into
+    /// the repo picker now, and the poll later.
     pub octocrab: Octocrab,
     pub login: String,
     pub rate: RateLimit,
@@ -112,6 +111,28 @@ pub async fn connect(token: String) -> Result<Connection, ConnectError> {
             limit: limits.resources.core.limit as u64,
         },
     })
+}
+
+/// List the repositories the token can watch: the ones the user owns,
+/// collaborates on, or can see through org membership. Newest-activity-first
+/// (`sort=pushed`), so the repos you're likely to want sit at the top of the
+/// picker.
+///
+/// `all_pages` walks GitHub's `Link` headers, so a user with more than 100 repos
+/// still gets the whole set — a handful of requests, once, on demand (not on the
+/// poll path, so it doesn't compete with the rate budget the poll guards).
+pub async fn list_repos(octocrab: &Octocrab) -> Result<Vec<Repo>, ConnectError> {
+    let first = octocrab
+        .current()
+        .list_repos_for_authenticated_user()
+        .affiliation("owner,collaborator,organization_member")
+        .sort("pushed")
+        .per_page(100)
+        .send()
+        .await
+        .map_err(diagnose)?;
+    let all = octocrab.all_pages(first).await.map_err(diagnose)?;
+    Ok(all.into_iter().filter_map(Repo::from_model).collect())
 }
 
 /// Step 1 of the device flow: ask GitHub for a user code. The returned
