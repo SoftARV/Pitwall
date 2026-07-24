@@ -17,8 +17,9 @@ use crate::github::types::WorkflowRun;
 
 #[derive(Debug)]
 pub enum RunRowOutput {
-    /// Open this run's page on github.com (nothing we don't do natively goes
-    /// through here for now; the detail page arrives next milestone).
+    /// Open this run's native detail page (the row was activated).
+    ShowDetails(u64),
+    /// Open this run's page on github.com (the browser button).
     OpenInBrowser(String),
 }
 
@@ -87,11 +88,10 @@ impl FactoryComponent for RunRow {
             set_subtitle: &self.subtitle(),
             set_subtitle_lines: 1,
 
-            // Activating the row opens the run on github.com. (The native detail
-            // page replaces this next milestone.)
+            // Activating the row opens the native detail page.
             set_activatable: true,
-            connect_activated[sender, url = self.run.html_url.clone()] => move |_| {
-                sender.output(RunRowOutput::OpenInBrowser(url.clone())).ok();
+            connect_activated[sender, id = self.run.id] => move |_| {
+                sender.output(RunRowOutput::ShowDetails(id)).ok();
             },
 
             // The shared status chip. `set_css_classes` replaces the whole list,
@@ -111,12 +111,16 @@ impl FactoryComponent for RunRow {
                 },
             },
 
-            // A hint that activating the row leaves the app for the browser.
-            add_suffix = &gtk::Image {
-                set_icon_name: Some("web-browser-symbolic"),
+            // Opens the run on github.com; activating the row itself opens the
+            // native detail page.
+            add_suffix = &gtk::Button {
+                set_icon_name: "web-browser-symbolic",
                 set_valign: gtk::Align::Center,
                 set_tooltip_text: Some("Open in browser"),
-                add_css_class: "dim-label",
+                add_css_class: "flat",
+                connect_clicked[sender, url = self.run.html_url.clone()] => move |_| {
+                    sender.output(RunRowOutput::OpenInBrowser(url.clone())).ok();
+                },
             },
         }
     }

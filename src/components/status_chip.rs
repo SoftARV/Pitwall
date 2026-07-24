@@ -89,6 +89,22 @@ pub fn variant(status: RunStatus, conclusion: Option<Conclusion>) -> &'static st
     }
 }
 
+/// Build a chip widget imperatively — for lists assembled outside `view!`, like
+/// the detail page's jobs and steps. Same structure and classes as the template.
+pub fn build(status: RunStatus, conclusion: Option<Conclusion>) -> gtk::Box {
+    let chip = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    chip.set_valign(gtk::Align::Center);
+    chip.set_css_classes(&["status-chip", variant(status, conclusion)]);
+
+    let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    dot.add_css_class("status-dot");
+    dot.set_valign(gtk::Align::Center);
+    chip.append(&dot);
+
+    chip.append(&gtk::Label::new(Some(label(status, conclusion))));
+    chip
+}
+
 /// Install the chip's stylesheet. Global, once, after GTK is initialised — call
 /// from `main` at startup. It has to be global: the variant and dot selectors
 /// depend on classes set at runtime, which per-widget CSS can't express.

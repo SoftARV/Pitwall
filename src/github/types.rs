@@ -11,7 +11,9 @@
 
 use chrono::{DateTime, Utc};
 use octocrab::models::Repository;
-use octocrab::models::workflows::Run;
+use octocrab::models::workflows::{
+    Conclusion as ApiConclusion, Job as ApiJob, Run, Status as ApiStatus, Step as ApiStep,
+};
 
 /// A snapshot of the authenticated **core** rate-limit budget.
 ///
@@ -90,6 +92,17 @@ impl RunStatus {
         }
     }
 
+    /// From octocrab's typed `Status` enum (jobs and steps use it, rather than
+    /// the run's string). `#[non_exhaustive]`, hence the catch-all.
+    fn from_status(status: &ApiStatus) -> Self {
+        match status {
+            ApiStatus::Queued | ApiStatus::Pending | ApiStatus::Waiting => RunStatus::Queued,
+            ApiStatus::InProgress => RunStatus::InProgress,
+            ApiStatus::Completed | ApiStatus::Failed => RunStatus::Completed,
+            _ => RunStatus::Unknown,
+        }
+    }
+
     /// A run still doing work — the poll should stay attentive to these (adaptive
     /// polling, later), and the header counts them as "running".
     pub fn is_active(self) -> bool {
@@ -129,6 +142,22 @@ impl Conclusion {
         }
     }
 
+    /// From octocrab's typed `Conclusion` enum (jobs and steps). It carries
+    /// fewer variants than the run's string form; `#[non_exhaustive]`, hence the
+    /// catch-all.
+    fn from_conclusion(conclusion: &ApiConclusion) -> Self {
+        match conclusion {
+            ApiConclusion::Success => Conclusion::Success,
+            ApiConclusion::Failure => Conclusion::Failure,
+            ApiConclusion::Cancelled => Conclusion::Cancelled,
+            ApiConclusion::Skipped => Conclusion::Skipped,
+            ApiConclusion::TimedOut => Conclusion::TimedOut,
+            ApiConclusion::ActionRequired => Conclusion::ActionRequired,
+            ApiConclusion::Neutral => Conclusion::Neutral,
+            _ => Conclusion::Unknown,
+        }
+    }
+
     /// A red, went-wrong outcome — what a failure notification keys off, and what
     /// the header counts as "failing".
     pub fn is_failure(self) -> bool {
@@ -154,6 +183,13 @@ pub struct WorkflowRun {
     pub status: RunStatus,
     pub conclusion: Option<Conclusion>,
     pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    /// The head commit's SHA (full; the detail page shows the short form).
+    pub head_sha: String,
+    /// The head commit message (may be multi-line; the UI takes the first line).
+    pub commit_message: String,
+    /// The head commit's author name.
+    pub commit_author: String,
     /// The run's page on github.com — for "open in browser".
     pub html_url: String,
 }
@@ -172,7 +208,57 @@ impl WorkflowRun {
             status: RunStatus::from_api(&run.status),
             conclusion: run.conclusion.as_deref().map(Conclusion::from_api),
             created_at: run.created_at,
+            updated_at: run.updated_at,
+            head_sha: run.head_sha,
+            commit_message: run.head_commit.message,
+            commit_author: run.head_commit.author.name,
             html_url: run.html_url.to_string(),
+        }
+    }
+}
+
+/// One job in a run — the unit the detail page lists, each with its steps.
+#[derive(Debug, Clone)]
+pub struct Job {
+    pub name: String,
+    pub status: RunStatus,
+    pub conclusion: Option<Conclusion>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub steps: Vec<Step>,
+}
+
+impl Job {
+    pub fn from_model(job: ApiJob) -> Self {
+        Self {
+            name: job.name,
+            status: RunStatus::from_status(&job.status),
+            conclusion: job.conclusion.map(|c| Conclusion::from_conclusion(&c)),
+            started_at: Some(job.started_at),
+            completed_at: job.completed_at,
+            steps: job.steps.into_iter().map(Step::from_model).collect(),
+        }
+    }
+}
+
+/// One step within a job.
+#[derive(Debug, Clone)]
+pub struct Step {
+    pub name: String,
+    pub status: RunStatus,
+    pub conclusion: Option<Conclusion>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+impl Step {
+    pub fn from_model(step: ApiStep) -> Self {
+        Self {
+            name: step.name,
+            status: RunStatus::from_status(&step.status),
+            conclusion: step.conclusion.map(|c| Conclusion::from_conclusion(&c)),
+            started_at: step.started_at,
+            completed_at: step.completed_at,
         }
     }
 }
@@ -211,5 +297,29 @@ mod tests {
         assert!(Conclusion::TimedOut.is_failure());
         assert!(!Conclusion::Success.is_failure());
         assert!(!Conclusion::Cancelled.is_failure());
+    }
+
+    #[test]
+    fn maps_octocrab_job_enums() {
+        assert_eq!(
+            RunStatus::from_status(&ApiStatus::InProgress),
+            RunStatus::InProgress
+        );
+        assert_eq!(
+            RunStatus::from_status(&ApiStatus::Queued),
+            RunStatus::Queued
+        );
+        assert_eq!(
+            RunStatus::from_status(&ApiStatus::Completed),
+            RunStatus::Completed
+        );
+        assert_eq!(
+            Conclusion::from_conclusion(&ApiConclusion::Success),
+            Conclusion::Success
+        );
+        assert_eq!(
+            Conclusion::from_conclusion(&ApiConclusion::TimedOut),
+            Conclusion::TimedOut
+        );
     }
 }
