@@ -1,0 +1,40 @@
+[package]
+name = "pitwall"
+version = "0.1.0-dev"
+edition = "2024"
+description = "A native GNOME app to monitor your GitHub Actions runs from the desktop"
+license = "GPL-3.0-or-later"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+
+# GitHub REST API client — the octocrab equivalent of Dockyard's bollard.
+# NOTE: octocrab's builder/handler API has shifted across versions. Do not trust
+# training data for it; check https://docs.rs/octocrab/0.54 before writing a call.
+octocrab = "0.54"
+
+# Secret Service (GNOME Keyring) client — pure Rust, written by GNOME developers.
+# The GitHub token lives here, never in the config file and never in a log.
+# 0.6 is the current *stable* line (0.7 is still an alpha).
+oo7 = "0.6"
+
+# `gnome_49` == libadwaita 1.8 / GTK 4.20 — the same install floor as the sibling
+# app (for adw::ShortcutsDialog and the modern dialogs). Take gtk4/libadwaita
+# *through* relm4 so their versions can never drift apart; do not add them as
+# direct dependencies.
+relm4 = { version = "0.11", features = ["libadwaita", "gnome_49"] }
+
+# octocrab needs a tokio runtime; relm4 owns one and runs our commands on it.
+# Pinned for parity with the sibling app; we may never touch it directly.
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+# Pagination streams and stream combinators.
+futures-util = "0.3"
+
+# GitHub timestamps (run created/updated, job started/finished, elapsed) arrive
+# as chrono DateTimes; we format and diff them for the UI.
+chrono = "0.4"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
