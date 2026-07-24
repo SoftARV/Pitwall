@@ -62,8 +62,11 @@ below is a consequence of that single difference. Keep it in mind:
 | Timestamps     | `chrono`                 | 0.4     |
 | Logging        | `tracing`                | 0.1     |
 
-Rust edition 2024. Plus `anyhow` 1 (rule 6) and `tracing-subscriber` 0.3 with
-`env-filter` for `RUST_LOG`. Toolchain must be ≥ 1.93 (relm4 0.11's MSRV);
+Rust edition 2024. Plus `anyhow` 1 (rule 6), `tracing-subscriber` 0.3 with
+`env-filter` for `RUST_LOG`, and `http` 1 / `secrecy` 0.10 for the device-flow
+sign-in (octocrab's `authenticate_as_device` wants a `SecretString` client id and
+an `ACCEPT` header; both crates are already in octocrab's tree, so they're
+near-free direct adds). Toolchain must be ≥ 1.93 (relm4 0.11's MSRV);
 libadwaita ≥ 1.8 / GTK ≥ 4.20 (the `gnome_49` floor — same reasoning as
 Dockyard: `adw::ShortcutsDialog` and the modern dialogs).
 
@@ -100,24 +103,34 @@ let runs = octocrab
 Jobs, logs, re-run and cancel live under the actions handler
 (`octocrab.actions()`). Map response models to our own types (rule 4).
 
-### 2. The token is a secret — keyring only
+### 2. Auth is GitHub's OAuth **device flow**; the token is a secret
 
-The GitHub token is stored in the **Secret Service (GNOME Keyring) via `oo7`**,
-keyed by the app ID. Rules:
+Sign-in uses the OAuth **device flow** — the flow built for native apps: no
+client secret, only a **public** `client_id` embedded in the source
+(`client::CLIENT_ID`; committing it is fine — every device-flow client ships one,
+`gh`'s included). First launch shows a "Sign in with GitHub" button; Pitwall then
+shows an 8-character user code, opens `github.com/login/device` in the browser
+and copies the code, and polls until you authorise. octocrab drives it
+(`authenticate_as_device` → `poll_until_available`), inside **one streaming relm4
+command** so it's cancelled if the app closes mid-flow. Scope is **`repo`** —
+GitHub has no Actions-only OAuth scope, so it's the narrowest that reads Actions
+on private + public repos (and later re-runs/cancels). Device-flow-*only* was a
+deliberate choice over a PAT paste: nicer UX, and the broad scope is acceptable
+for a personal monitor of your own repos.
+
+The resulting OAuth access token is stored in the **Secret Service (GNOME
+Keyring) via `oo7`**, keyed by the app ID. Rules:
 
 - **Never** write the token to the config file, to `tracing`, or to any error
-  string. `settings.rs` persists *preferences*; the token is not a preference.
-- First launch, with no token, shows an `adw::StatusPage` with an entry to paste
-  a fine-grained PAT (scope: `Actions: read` + repo metadata; add write only for
-  re-run/cancel). Store it, then connect.
-- **Verify the token, don't just check it exists.** A stored token can be
-  revoked or expired. After building the client, make one cheap authenticated
-  call (`/user` or `/rate_limit`) — the octocrab analog of Dockyard's `ping()` —
-  before declaring "connected". A present-but-dead token must not render an
-  empty, healthy-looking list.
-- Errors name the fix: **401** → "token invalid or expired — update it in
-  Preferences"; **403 rate limit** → "rate limit reached, resets in N min";
-  **404** → "repo not found or the token can't see it"; network → "offline".
+  string. `settings.rs` persists *preferences*; the token is not one. The
+  `client_id` is public and is **not** the secret — only the access token is.
+- **Verify, don't assume.** A stored token can be revoked or expired. After
+  building the client, make one cheap authenticated call (`/user` + `/rate_limit`)
+  — the octocrab analog of Dockyard's `ping()` — before declaring "connected". A
+  present-but-dead token must not render an empty, healthy-looking list.
+- Errors name the fix: **401** → "sign in again"; **403 rate limit** → "rate
+  limit reached, resets in N min"; **404** → "repo not found or no access";
+  network → "offline".
 
 ### 3. Rate limits are the budget — poll conditionally
 
@@ -210,7 +223,7 @@ struct AppModel {
     all_runs: Vec<WorkflowRun>,          // full set from the last poll; the filter reads this
     last_conclusion: HashMap<RunId, Conclusion>, // to detect transitions -> notify
     query: String,                       // search text
-    state: ViewState,                    // NeedsToken | Loading | Ready | Disconnected(String)
+    state: ViewState,                    // Loading | NeedsAuth | AwaitingAuth | Ready | Disconnected(String)
     pending: HashMap<RunId, RunAction>,  // re-run / cancel in flight
     refreshing: bool,                    // user-initiated refresh only
     poll: Option<glib::SourceId>,        // None while the window is hidden
@@ -222,7 +235,7 @@ struct AppModel {
 
 enum AppMsg {
     Refresh, ManualRefresh,
-    TokenEntered(String), ClearToken,
+    SignIn, CancelAuth, SignOut,         // OAuth device-flow sign-in
     Rerun(RunId), RerunFailed(RunId), Cancel(RunId),
     ShowDetails(RunId),
     OpenInBrowser(RunId),                // html_url -> the web UI, for anything we don't do natively
@@ -272,8 +285,9 @@ This is Redux with a compiler: actions in, one reducer, view derived from state.
   independent) — but **fetched, not streamed** (REST has no follow; completed
   jobs only). Show a spinner while fetching; offer "Open in browser" for a
   running job whose logs aren't downloadable yet.
-- **First run / no token**: an `adw::StatusPage` with a token entry and a link to
-  GitHub's fine-grained-PAT settings. **No watched repos**: a StatusPage inviting
+- **First run / not signed in**: an `adw::StatusPage` with a "Sign in with GitHub"
+  button → the device-flow screen (user code + browser authorisation). **No
+  watched repos**: a StatusPage inviting
   "Add repositories" → the repo picker. Empty / no-results / disconnected /
   rate-limited: distinct `adw::StatusPage`s. Errors: `adw::ToastOverlay`.
 - **Use libadwaita widgets, not raw GTK.** `adw::ActionRow`, `adw::PreferencesGroup`,
