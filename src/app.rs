@@ -174,13 +174,11 @@ pub enum AppMsg {
     ManualRefresh,
     /// Open a run's native detail page (a row was activated).
     ShowDetails(u64),
-    /// Open a step's log page (a step was activated in the detail).
-    ShowStepLog {
+    /// Open a job's log page (a job's "View log" was activated in the detail).
+    ShowJobLog {
         repo: String,
-        run_id: u64,
+        job_id: u64,
         job_name: String,
-        step_number: i64,
-        step_name: String,
         completed: bool,
         html_url: String,
     },
@@ -1068,20 +1066,16 @@ impl Component for AppModel {
                     })
                     .forward(sender.input_sender(), |output| match output {
                         RunDetailOutput::OpenInBrowser(url) => AppMsg::OpenInBrowser(url),
-                        RunDetailOutput::ShowStepLog {
+                        RunDetailOutput::ShowJobLog {
                             repo,
-                            run_id,
+                            job_id,
                             job_name,
-                            step_number,
-                            step_name,
                             completed,
                             html_url,
-                        } => AppMsg::ShowStepLog {
+                        } => AppMsg::ShowJobLog {
                             repo,
-                            run_id,
+                            job_id,
                             job_name,
-                            step_number,
-                            step_name,
                             completed,
                             html_url,
                         },
@@ -1090,12 +1084,10 @@ impl Component for AppModel {
                 self.detail = Some(controller);
             }
 
-            AppMsg::ShowStepLog {
+            AppMsg::ShowJobLog {
                 repo,
-                run_id,
+                job_id,
                 job_name,
-                step_number,
-                step_name,
                 completed,
                 html_url,
             } => {
@@ -1106,10 +1098,8 @@ impl Component for AppModel {
                     .launch(LogViewInit {
                         octocrab: connection.octocrab.clone(),
                         repo,
-                        run_id,
+                        job_id,
                         job_name,
-                        step_number,
-                        step_name,
                         completed,
                         html_url,
                     })
