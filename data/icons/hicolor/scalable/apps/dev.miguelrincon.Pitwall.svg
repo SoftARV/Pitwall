@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" fill="none">
+  <defs>
+    <linearGradient id="pb-board" x1="64" y1="14" x2="64" y2="94" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4a4455"></stop>
+      <stop offset="0.5" stop-color="#3d3846"></stop>
+      <stop offset="1" stop-color="#2b2635"></stop>
+    </linearGradient>
+    <linearGradient id="pb-face" x1="64" y1="22" x2="64" y2="86" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2a2437"></stop>
+      <stop offset="1" stop-color="#1f1a29"></stop>
+    </linearGradient>
+    <linearGradient id="pb-pole" x1="58" y1="100" x2="70" y2="100" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#8d8c89"></stop>
+      <stop offset="0.5" stop-color="#c0bfbc"></stop>
+      <stop offset="1" stop-color="#8d8c89"></stop>
+    </linearGradient>
+    <linearGradient id="pb-green" x1="30" y1="30" x2="92" y2="42" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4ade92"></stop>
+      <stop offset="1" stop-color="#33d17a"></stop>
+    </linearGradient>
+    <linearGradient id="pb-red" x1="30" y1="66" x2="98" y2="78" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#e01b24"></stop>
+      <stop offset="1" stop-color="#c01c28"></stop>
+    </linearGradient>
+  </defs>
+  <rect x="58" y="86" width="12" height="30" rx="6" fill="url(#pb-pole)"></rect>
+  <rect x="14" y="14" width="100" height="78" rx="14" fill="url(#pb-board)"></rect>
+  <rect x="14.75" y="14.75" width="98.5" height="76.5" rx="13.25" stroke="#ffffff" stroke-opacity="0.10" stroke-width="1.5"></rect>
+  <rect x="22" y="22" width="84" height="62" rx="8" fill="url(#pb-face)"></rect>
+  <rect x="22.75" y="22.75" width="82.5" height="60.5" rx="7.25" stroke="#000000" stroke-opacity="0.35" stroke-width="1.5"></rect>
+  <g fill="#ffffff" fill-opacity="0.07">
+    <rect x="30" y="28" width="68" height="13" rx="6.5"></rect>
+    <rect x="30" y="46" width="68" height="13" rx="6.5"></rect>
+    <rect x="30" y="64" width="68" height="13" rx="6.5"></rect>
+  </g>
+  <rect x="30" y="28" width="62" height="13" rx="6.5" fill="url(#pb-green)"></rect>
+  <rect x="30" y="46" width="44" height="13" rx="6.5" fill="#2ec27e"></rect>
+  <rect x="30" y="64" width="68" height="13" rx="6.5" fill="url(#pb-red)"></rect>
+</svg>
