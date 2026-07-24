@@ -36,5 +36,12 @@ futures-util = "0.3"
 # as chrono DateTimes; we format and diff them for the UI.
 chrono = "0.4"
 
+# OAuth device flow: octocrab's `authenticate_as_device` takes the client id as a
+# `secrecy::SecretString`, and the github.com auth endpoint needs an `http`
+# `ACCEPT` header. Both crates are already in octocrab's tree; pinned to the
+# versions it resolves so the shared types match exactly.
+http = "1"
+secrecy = "0.10"
+
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
