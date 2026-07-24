@@ -30,6 +30,7 @@ fn main() {
     // shared status chip (each owns its own stylesheet).
     app::install_css();
     components::status_chip::install_css();
+    components::log_view::install_css();
 
     // Load persisted settings and apply the theme before the window is shown, so
     // there's no flash of the wrong colour scheme. The model owns them from here.

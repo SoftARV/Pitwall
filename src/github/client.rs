@@ -293,6 +293,43 @@ pub async fn list_jobs(
     Ok(page.items.into_iter().map(Job::from_model).collect())
 }
 
+/// Download one job's full log as raw text — timestamps, ANSI colours and
+/// `##[…]` markers intact. The log view parses those into collapsible, coloured
+/// sections (see `components::log_view`); keeping them here would throw away the
+/// very structure it renders.
+///
+/// The endpoint 302-redirects to a signed URL; `follow_location_to_data` chases
+/// it — the same path octocrab's own log-zip download uses, so the redirect and
+/// auth are handled for us. Logs exist only for a **completed** job; the caller
+/// gates on that (a running job would 404 here).
+pub async fn fetch_job_log(
+    octocrab: &Octocrab,
+    owner: &str,
+    repo: &str,
+    job_id: u64,
+) -> Result<String, String> {
+    let uri = format!("/repos/{owner}/{repo}/actions/jobs/{job_id}/logs");
+    let response = octocrab
+        ._get(uri)
+        .await
+        .map_err(|err| diagnose(err).message().to_owned())?;
+    let response = octocrab
+        .follow_location_to_data(response)
+        .await
+        .map_err(|err| diagnose(err).message().to_owned())?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!(
+            "GitHub returned HTTP {} for this job's log",
+            status.as_u16()
+        ));
+    }
+    octocrab
+        .body_to_string(response)
+        .await
+        .map_err(|err| diagnose(err).message().to_owned())
+}
+
 /// Step 1 of the device flow: ask GitHub for a user code. The returned
 /// `DeviceFlow` carries the code to show the user and the handle to poll with.
 ///

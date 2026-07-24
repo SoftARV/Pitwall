@@ -5,6 +5,7 @@
 //! `FactoryComponent`); none import `octocrab` — they speak only our own types
 //! from `github::types` (CLAUDE.md rule 4).
 
+pub mod log_view;
 pub mod repo_picker;
 pub mod run_detail;
 pub mod run_row;

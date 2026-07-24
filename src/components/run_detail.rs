@@ -46,6 +46,17 @@ enum JobsState {
 pub enum RunDetailOutput {
     /// Open this run on github.com (the header button).
     OpenInBrowser(String),
+    /// A job's "View log" was activated — open its log page. Carries what the
+    /// log view needs to fetch and render the whole job log.
+    ShowJobLog {
+        repo: String,
+        job_id: u64,
+        /// The job's name — the log page's title.
+        job_name: String,
+        /// Logs exist only for a finished job; a running one shows a placeholder.
+        completed: bool,
+        html_url: String,
+    },
 }
 
 #[derive(Debug)]
@@ -99,13 +110,42 @@ impl RunDetail {
     /// Fill the jobs group with one expandable row per job, each expanding to its
     /// steps. Built imperatively (dynamic count); the chips use the shared
     /// `status_chip::build`. Called once, so there's nothing to clear first.
-    fn populate_jobs(&self, jobs: &[Job]) {
+    /// Each job's "View log" button emits `ShowJobLog` so the app can push its
+    /// log page.
+    fn populate_jobs(&self, jobs: &[Job], sender: &ComponentSender<Self>) {
         for job in jobs {
             let row = adw::ExpanderRow::new();
             row.set_title(&job.name);
             row.set_subtitle(&job_duration(job));
+
+            // "View log" opens the whole job's log. It's a plain button, so
+            // clicking it doesn't toggle the expander — only the row's title area
+            // does. Placed before the chip so the status chip stays rightmost.
+            let log_button = gtk::Button::from_icon_name("utilities-terminal-symbolic");
+            log_button.set_tooltip_text(Some("View log"));
+            log_button.set_valign(gtk::Align::Center);
+            log_button.add_css_class("flat");
+            let output = sender.output_sender().clone();
+            let repo = self.run.repo.clone();
+            let html_url = self.run.html_url.clone();
+            let job_name = job.name.clone();
+            let job_id = job.id;
+            let completed = job.status == RunStatus::Completed;
+            log_button.connect_clicked(move |_| {
+                output
+                    .send(RunDetailOutput::ShowJobLog {
+                        repo: repo.clone(),
+                        job_id,
+                        job_name: job_name.clone(),
+                        completed,
+                        html_url: html_url.clone(),
+                    })
+                    .ok();
+            });
+            row.add_suffix(&log_button);
             row.add_suffix(&status_chip::build(job.status, job.conclusion));
 
+            // Steps are informational: status chip + duration, not clickable.
             for step in &job.steps {
                 let step_row = adw::ActionRow::new();
                 step_row.set_title(&step.name);
@@ -271,13 +311,13 @@ impl Component for RunDetail {
     fn update_cmd(
         &mut self,
         msg: Self::CommandOutput,
-        _sender: ComponentSender<Self>,
+        sender: ComponentSender<Self>,
         _root: &Self::Root,
     ) {
         match msg {
             RunDetailCmd::JobsLoaded(result) => match *result {
                 Ok(jobs) => {
-                    self.populate_jobs(&jobs);
+                    self.populate_jobs(&jobs, &sender);
                     self.state = JobsState::Loaded;
                 }
                 Err(message) => {

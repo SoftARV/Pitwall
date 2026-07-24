@@ -220,6 +220,8 @@ impl WorkflowRun {
 /// One job in a run — the unit the detail page lists, each with its steps.
 #[derive(Debug, Clone)]
 pub struct Job {
+    /// GitHub's job id — the key to the per-job log endpoint.
+    pub id: u64,
     pub name: String,
     pub status: RunStatus,
     pub conclusion: Option<Conclusion>,
@@ -231,6 +233,7 @@ pub struct Job {
 impl Job {
     pub fn from_model(job: ApiJob) -> Self {
         Self {
+            id: job.id.into_inner(),
             name: job.name,
             status: RunStatus::from_status(&job.status),
             conclusion: job.conclusion.map(|c| Conclusion::from_conclusion(&c)),
