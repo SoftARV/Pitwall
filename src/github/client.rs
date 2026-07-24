@@ -7,8 +7,12 @@
 //! was checked against octocrab 0.54's own source, not memory. Rule 4: octocrab
 //! types are mapped into ours (`RateLimit`) before leaving this module.
 
-use http::header::ACCEPT;
-use octocrab::Octocrab;
+use std::collections::HashMap;
+
+use chrono::DateTime;
+use http::header::{ACCEPT, ETAG, IF_NONE_MATCH};
+use http::{HeaderMap, HeaderValue};
+use octocrab::{FromResponse, Octocrab, Page};
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::github::types::{RateLimit, Repo, WorkflowRun};
@@ -109,6 +113,7 @@ pub async fn connect(token: String) -> Result<Connection, ConnectError> {
         rate: RateLimit {
             remaining: limits.resources.core.remaining as u64,
             limit: limits.resources.core.limit as u64,
+            reset: DateTime::from_timestamp(limits.resources.core.reset as i64, 0),
         },
     })
 }
@@ -135,49 +140,139 @@ pub async fn list_repos(octocrab: &Octocrab) -> Result<Vec<Repo>, ConnectError> 
     Ok(all.into_iter().filter_map(Repo::from_model).collect())
 }
 
-/// List recent workflow runs across the watched repos, newest first.
-///
-/// One request per repo (ETag conditional requests will make idle ones free —
-/// that's M2). A single repo failing — deleted, renamed, access revoked — is
-/// logged and skipped rather than sinking the whole poll; but if *every* repo
-/// fails (the offline / bad-token case) that's surfaced, so the UI never renders
-/// an empty, healthy-looking list against a dead connection (CLAUDE.md rule 2).
-pub async fn list_runs(octocrab: &Octocrab, repos: &[String]) -> Result<Vec<WorkflowRun>, String> {
-    let mut runs = Vec::new();
-    let mut failures = 0;
-    let mut last_error = String::new();
+/// The outcome of polling one repo's runs.
+#[derive(Debug)]
+pub enum RunsOutcome {
+    /// New data (HTTP 200): the runs, plus the ETag to send next time.
+    Fresh {
+        etag: Option<String>,
+        runs: Vec<WorkflowRun>,
+    },
+    /// 304 Not Modified — nothing changed, and it did **not** cost a request
+    /// against the rate limit. This is what makes idle repos free to poll.
+    NotModified,
+    /// The request failed (404, offline, …); the message names the fix.
+    Failed(String),
+}
+
+/// One repo's slot in a poll.
+#[derive(Debug)]
+pub struct RepoRuns {
+    pub repo: String,
+    pub outcome: RunsOutcome,
+}
+
+/// The result of one poll across the watched repos.
+#[derive(Debug)]
+pub struct Poll {
+    pub repos: Vec<RepoRuns>,
+    /// The budget after the last response that carried the `X-RateLimit-*`
+    /// headers (they ride on 304s too).
+    pub rate: Option<RateLimit>,
+}
+
+/// Poll every watched repo's runs **conditionally**: send the stored ETag as
+/// `If-None-Match`, so an unchanged repo answers `304 Not Modified` — which
+/// costs nothing against the rate limit (CLAUDE.md rule 3). The caller keeps the
+/// ETags and the per-repo runs between polls; this reports only what changed.
+pub async fn poll_runs(
+    octocrab: &Octocrab,
+    repos: &[String],
+    etags: &HashMap<String, String>,
+) -> Poll {
+    let mut results = Vec::with_capacity(repos.len());
+    let mut rate = None;
 
     for repo in repos {
-        let Some((owner, name)) = repo.split_once('/') else {
-            continue;
-        };
-        match octocrab
-            .workflows(owner, name)
-            .list_all_runs()
-            .per_page(20)
-            .send()
-            .await
-        {
-            Ok(page) => runs.extend(
-                page.items
-                    .into_iter()
-                    .map(|run| WorkflowRun::from_model(run, repo.clone())),
-            ),
-            Err(err) => {
-                failures += 1;
-                last_error = diagnose(err).message().to_owned();
-                tracing::warn!(repo = %repo, "couldn't list runs: {last_error}");
+        let outcome = match repo.split_once('/') {
+            Some((owner, name)) => {
+                match fetch_runs(octocrab, owner, name, etags.get(repo).map(String::as_str)).await {
+                    Ok((outcome, response_rate)) => {
+                        // Keep the freshest budget; the headers ride on 304s too.
+                        if response_rate.is_some() {
+                            rate = response_rate;
+                        }
+                        outcome
+                    }
+                    Err(error) => RunsOutcome::Failed(error),
+                }
             }
+            None => RunsOutcome::Failed(format!("“{repo}” isn't a valid owner/name")),
+        };
+        results.push(RepoRuns {
+            repo: repo.clone(),
+            outcome,
+        });
+    }
+
+    Poll {
+        repos: results,
+        rate,
+    }
+}
+
+/// One repo's conditional runs request, dropped to the low level so we can send
+/// `If-None-Match` and read the `ETag` / `X-RateLimit-*` headers — octocrab's
+/// typed builder exposes none of that.
+async fn fetch_runs(
+    octocrab: &Octocrab,
+    owner: &str,
+    name: &str,
+    etag: Option<&str>,
+) -> Result<(RunsOutcome, Option<RateLimit>), String> {
+    let uri = format!("/repos/{owner}/{name}/actions/runs?per_page=20");
+
+    let mut headers = HeaderMap::new();
+    if let Some(etag) = etag
+        && let Ok(value) = HeaderValue::from_str(etag)
+    {
+        headers.insert(IF_NONE_MATCH, value);
+    }
+
+    let response = octocrab
+        ._get_with_headers(uri, Some(headers))
+        .await
+        .map_err(|err| diagnose(err).message().to_owned())?;
+
+    // `_get_with_headers` returns the raw response — the typed path's
+    // error-mapping isn't applied — so a 304 arrives as a plain response for us
+    // to branch on rather than as an error.
+    let status = response.status().as_u16();
+    let rate = read_rate(response.headers());
+
+    match status {
+        304 => Ok((RunsOutcome::NotModified, rate)),
+        200 => {
+            let etag = response
+                .headers()
+                .get(ETAG)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            // Parse with octocrab's own `Page<Run>` deserialiser (it knows the
+            // `workflow_runs` wrapper), then narrow to our type.
+            let page = Page::<octocrab::models::workflows::Run>::from_response(response)
+                .await
+                .map_err(|err| diagnose(err).message().to_owned())?;
+            let repo = format!("{owner}/{name}");
+            let runs = page
+                .items
+                .into_iter()
+                .map(|run| WorkflowRun::from_model(run, repo.clone()))
+                .collect();
+            Ok((RunsOutcome::Fresh { etag, runs }, rate))
         }
+        code => Err(format!("GitHub returned HTTP {code} for {owner}/{name}")),
     }
+}
 
-    if !repos.is_empty() && failures == repos.len() {
-        return Err(last_error);
-    }
-
-    // Newest first: the list reads top-down like an activity feed.
-    runs.sort_by_key(|run| std::cmp::Reverse(run.created_at));
-    Ok(runs)
+/// Read the `X-RateLimit-*` budget from a response's headers, if present.
+fn read_rate(headers: &HeaderMap) -> Option<RateLimit> {
+    let number = |name: &str| -> Option<u64> { headers.get(name)?.to_str().ok()?.parse().ok() };
+    Some(RateLimit {
+        remaining: number("x-ratelimit-remaining")?,
+        limit: number("x-ratelimit-limit")?,
+        reset: number("x-ratelimit-reset").and_then(|ts| DateTime::from_timestamp(ts as i64, 0)),
+    })
 }
 
 /// Step 1 of the device flow: ask GitHub for a user code. The returned

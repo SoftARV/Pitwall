@@ -14,6 +14,8 @@
 //! code + browser authorisation → the modal closes onto the app. A saved token
 //! in the keyring reconnects silently at startup, skipping the modal entirely.
 
+use std::collections::HashMap;
+
 use futures_util::FutureExt;
 use relm4::actions::{AccelsPlus, RelmAction, RelmActionGroup};
 use relm4::adw::prelude::*;
@@ -26,8 +28,8 @@ use relm4::{
 
 use crate::components::repo_picker::{RepoPicker, RepoPickerInit, RepoPickerOutput};
 use crate::components::run_row::{RunRow, RunRowInput, RunRowOutput};
-use crate::github::client::{self, ConnectError, Connection};
-use crate::github::types::{Conclusion, WorkflowRun};
+use crate::github::client::{self, ConnectError, Connection, RepoRuns, RunsOutcome};
+use crate::github::types::{Conclusion, RateLimit, WorkflowRun};
 use crate::secret;
 use crate::settings::Settings;
 
@@ -111,9 +113,16 @@ pub struct AppModel {
     watched: Vec<String>,
     /// The visible run rows, reconciled in place from `all_runs` (rule 7).
     runs: FactoryVecDeque<RunRow>,
-    /// The full run set from the last poll — what the header count and the
-    /// reconcile read.
+    /// The full run set derived from `runs_by_repo` — what the header count and
+    /// the reconcile read.
     all_runs: Vec<WorkflowRun>,
+    /// Per-repo runs, the source `all_runs` is rebuilt from. A repo that answers
+    /// 304 keeps its slot untouched, so unchanged repos cost nothing to re-poll.
+    runs_by_repo: HashMap<String, Vec<WorkflowRun>>,
+    /// Per-repo ETag, sent as `If-None-Match` so idle repos answer 304 (free).
+    etags: HashMap<String, String>,
+    /// The latest rate-limit budget, from the poll's response headers.
+    rate: Option<RateLimit>,
     /// Whether a poll has landed since connecting: tells "still loading" apart
     /// from "genuinely no runs".
     runs_loaded: bool,
@@ -183,10 +192,8 @@ pub enum CommandMsg {
         generation: u64,
         result: Box<Result<Connection, ConnectError>>,
     },
-    /// A poll returned the runs across the watched repos.
-    RunsLoaded(Vec<WorkflowRun>),
-    /// A poll failed for every watched repo (offline / bad token).
-    RunsFailed(String),
+    /// A conditional poll came back (per-repo outcomes + the rate budget).
+    RunsPolled(Box<client::Poll>),
 }
 
 impl AppModel {
@@ -281,7 +288,46 @@ impl AppModel {
         }
     }
 
-    /// Fire off a run-list fetch across the watched repos, off-thread.
+    /// Whether the whole rate-limit budget is spent and we should pause polling
+    /// until it resets, rather than earn a 403.
+    fn rate_exhausted(&self) -> bool {
+        self.rate.is_some_and(|rate| rate.is_exhausted())
+    }
+
+    /// The rate-limit banner text, when the budget is low enough to warn about.
+    fn rate_banner(&self) -> Option<String> {
+        let rate = self.rate?;
+        if rate.is_exhausted() {
+            Some(format!(
+                "GitHub rate limit reached — polling paused, resets in {} min.",
+                rate.resets_in_minutes(),
+            ))
+        } else if rate.remaining < 100 {
+            Some(format!(
+                "Approaching GitHub's rate limit: {} requests left, resets in {} min.",
+                rate.remaining,
+                rate.resets_in_minutes(),
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Rebuild `all_runs` from the per-repo cache: only watched repos, newest
+    /// first. Called after each poll and after the watch set changes.
+    fn rebuild_runs(&mut self) {
+        let mut runs: Vec<WorkflowRun> = self
+            .watched
+            .iter()
+            .filter_map(|repo| self.runs_by_repo.get(repo))
+            .flatten()
+            .cloned()
+            .collect();
+        runs.sort_by_key(|run| std::cmp::Reverse(run.created_at));
+        self.all_runs = runs;
+    }
+
+    /// Fire off a conditional run poll across the watched repos, off-thread.
     fn dispatch_refresh(&self, sender: &ComponentSender<Self>) {
         let Some(connection) = &self.connection else {
             return;
@@ -293,11 +339,9 @@ impl AppModel {
         // command needs `'static + Send` data it owns, not a borrow of `self`.
         let octocrab = connection.octocrab.clone();
         let repos = self.watched.clone();
+        let etags = self.etags.clone();
         sender.oneshot_command(async move {
-            match client::list_runs(&octocrab, &repos).await {
-                Ok(runs) => CommandMsg::RunsLoaded(runs),
-                Err(reason) => CommandMsg::RunsFailed(reason),
-            }
+            CommandMsg::RunsPolled(Box::new(client::poll_runs(&octocrab, &repos, &etags).await))
         });
     }
 
@@ -488,13 +532,19 @@ impl AppModel {
         if let Some(onboarding) = self.onboarding.take() {
             onboarding.dialog.force_close();
         }
+        // Fresh connection → fresh run state (a different account may be behind
+        // it); seed the rate from the connect-time budget.
+        self.rate = Some(connection.rate);
         self.connection = Some(connection);
         self.state = ViewState::Ready;
         self.device = None;
+        self.runs_by_repo.clear();
+        self.etags.clear();
+        self.all_runs.clear();
+        self.runs.guard().clear();
         self.runs_loaded = false;
         self.set_signed_in(true);
-        // A fresh connection: poll now and on the interval (both no-op if the
-        // watch list is empty).
+        // Poll now and on the interval (both no-op if the watch list is empty).
         self.start_poll(sender);
         self.dispatch_refresh(sender);
     }
@@ -556,6 +606,15 @@ impl Component for AppModel {
                             set_spinning: model.refreshing,
                             set_valign: gtk::Align::Center,
                         },
+                    },
+
+                    // A rate-limit warning, revealed only when the budget runs
+                    // low (rare with conditional requests, but honest when it does).
+                    add_top_bar = &adw::Banner {
+                        #[watch]
+                        set_revealed: model.rate_banner().is_some(),
+                        #[watch]
+                        set_title: model.rate_banner().as_deref().unwrap_or_default(),
                     },
 
                     // One page per state. Onboarding (sign-in) is a modal over
@@ -713,6 +772,9 @@ impl Component for AppModel {
             repo_picker: None,
             runs,
             all_runs: Vec::new(),
+            runs_by_repo: HashMap::new(),
+            etags: HashMap::new(),
+            rate: None,
             runs_loaded: false,
             refreshing: false,
             poll: None,
@@ -914,21 +976,37 @@ impl Component for AppModel {
                 self.settings.save();
                 // The dialog closed itself on Save; drop its controller.
                 self.repo_picker = None;
-                // The watch set changed: clear the old runs and re-poll from
-                // scratch (both no-op if the set is now empty → the no-repos page).
-                self.all_runs.clear();
-                self.runs.guard().clear();
+                // Keep caches for still-watched repos (their re-poll is a free
+                // 304); drop the rest.
+                let watched = self.watched.clone();
+                self.runs_by_repo.retain(|repo, _| watched.contains(repo));
+                self.etags.retain(|repo, _| watched.contains(repo));
+                self.rebuild_runs();
+                // Show "loading" until the re-poll lands (new repos have no cache).
                 self.runs_loaded = false;
                 self.stop_poll();
                 self.start_poll(&sender);
                 self.dispatch_refresh(&sender);
             }
 
-            AppMsg::Refresh => self.dispatch_refresh(&sender),
+            AppMsg::Refresh => {
+                // The poll timer keeps ticking while the budget's exhausted; the
+                // tick just no-ops until it resets.
+                if !self.rate_exhausted() {
+                    self.dispatch_refresh(&sender);
+                }
+            }
 
             AppMsg::ManualRefresh => {
-                self.refreshing = true;
-                self.dispatch_refresh(&sender);
+                if let Some(rate) = self.rate.filter(RateLimit::is_exhausted) {
+                    self.toast(&format!(
+                        "Rate limit reached — resets in {} min.",
+                        rate.resets_in_minutes(),
+                    ));
+                } else {
+                    self.refreshing = true;
+                    self.dispatch_refresh(&sender);
+                }
             }
 
             AppMsg::OpenInBrowser(url) => Self::open_uri(&url, root),
@@ -940,7 +1018,7 @@ impl Component for AppModel {
                     self.start_poll(&sender);
                     // Whatever we last drew is as stale as the pause was long, so
                     // refresh now rather than waiting for the first tick.
-                    if matches!(self.state, ViewState::Ready) {
+                    if matches!(self.state, ViewState::Ready) && !self.rate_exhausted() {
                         self.dispatch_refresh(&sender);
                     }
                 }
@@ -962,12 +1040,20 @@ impl Component for AppModel {
                     .issue_url("https://github.com/SoftARV/Pitwall/issues")
                     .license_type(gtk::License::Gpl30)
                     .copyright("© 2026 Miguel Rincon")
-                    .debug_info(match &self.connection {
-                        Some(connection) => format!(
-                            "Signed in as {}\nRate limit: {} / {} requests remaining this hour",
-                            connection.login, connection.rate.remaining, connection.rate.limit,
-                        ),
-                        None => "Not connected".to_owned(),
+                    .debug_info({
+                        let mut info = match &self.connection {
+                            Some(connection) => format!("Signed in as {}", connection.login),
+                            None => "Not connected".to_owned(),
+                        };
+                        if let Some(rate) = self.rate {
+                            info.push_str(&format!(
+                                "\nRate limit: {} / {} remaining, resets in {} min",
+                                rate.remaining,
+                                rate.limit,
+                                rate.resets_in_minutes(),
+                            ));
+                        }
+                        info
                     })
                     .build();
                 about.present(Some(root));
@@ -1060,24 +1146,49 @@ impl Component for AppModel {
                 }
             }
 
-            CommandMsg::RunsLoaded(runs) => {
-                self.all_runs = runs;
-                self.runs_loaded = true;
+            CommandMsg::RunsPolled(poll) => {
                 self.refreshing = false;
-                self.apply_runs();
-            }
-
-            CommandMsg::RunsFailed(reason) => {
-                self.refreshing = false;
-                if self.runs_loaded {
-                    // We already have runs; a transient failure shouldn't wipe
-                    // them — keep the last set and just say so.
-                    self.toast(&format!("Couldn't refresh: {reason}"));
-                } else {
-                    // Never loaded and every repo failed: treat it as offline.
-                    self.stop_poll();
-                    self.state = ViewState::Disconnected(reason);
+                let poll = *poll;
+                if let Some(rate) = poll.rate {
+                    self.rate = Some(rate);
                 }
+
+                let total = poll.repos.len();
+                let mut failed = 0;
+                let mut last_error = String::new();
+                for RepoRuns { repo, outcome } in poll.repos {
+                    match outcome {
+                        RunsOutcome::Fresh { etag, runs } => {
+                            if let Some(etag) = etag {
+                                self.etags.insert(repo.clone(), etag);
+                            }
+                            self.runs_by_repo.insert(repo, runs);
+                        }
+                        // 304: keep the cached runs and ETag untouched.
+                        RunsOutcome::NotModified => {}
+                        RunsOutcome::Failed(error) => {
+                            tracing::warn!(repo = %repo, "poll failed: {error}");
+                            failed += 1;
+                            last_error = error;
+                        }
+                    }
+                }
+
+                // Every repo failed — offline / bad token. Don't wipe a list we
+                // already have, but if we never loaded one, say so.
+                if total > 0 && failed == total {
+                    if self.runs_loaded {
+                        self.toast(&format!("Couldn't refresh: {last_error}"));
+                    } else {
+                        self.stop_poll();
+                        self.state = ViewState::Disconnected(last_error);
+                    }
+                    return;
+                }
+
+                self.rebuild_runs();
+                self.runs_loaded = true;
+                self.apply_runs();
             }
         }
     }
