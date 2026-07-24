@@ -4,6 +4,7 @@
 mod app;
 mod components;
 mod github;
+mod notify;
 mod secret;
 mod settings;
 

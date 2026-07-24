@@ -10,13 +10,15 @@
 //! token goes: the token is a secret and lives in the keyring (`secret.rs`),
 //! never here.
 //!
-//! Holds the theme and the watched-repo list; later milestones add the poll
-//! interval and notification preferences.
+//! Holds the theme, the watched-repo list, and the notification preference; a
+//! later milestone adds the poll interval.
 
 use std::path::PathBuf;
 
 use relm4::adw;
 use relm4::gtk::glib;
+
+use crate::github::types::Conclusion;
 
 /// The window's colour scheme: follow the desktop, or force light/dark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -57,6 +59,46 @@ impl Theme {
     }
 }
 
+/// When to raise a desktop notification for a run that has just finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NotifyOn {
+    /// Never notify.
+    Off,
+    /// Only when a run finishes in a failure state — the app's headline feature.
+    #[default]
+    Failures,
+    /// Every finished run, pass or fail.
+    All,
+}
+
+impl NotifyOn {
+    /// Whether a run finishing with `conclusion` should raise a notification.
+    pub fn wants(self, conclusion: Conclusion) -> bool {
+        match self {
+            NotifyOn::Off => false,
+            NotifyOn::Failures => conclusion.is_failure(),
+            NotifyOn::All => true,
+        }
+    }
+
+    /// The stable string written to the config file.
+    fn as_key(self) -> &'static str {
+        match self {
+            NotifyOn::Off => "off",
+            NotifyOn::Failures => "failures",
+            NotifyOn::All => "all",
+        }
+    }
+
+    fn from_key(key: &str) -> Self {
+        match key {
+            "off" => NotifyOn::Off,
+            "all" => NotifyOn::All,
+            _ => NotifyOn::Failures,
+        }
+    }
+}
+
 /// The app's global settings. Loaded once at startup, saved on every change.
 #[derive(Debug, Clone, Default)]
 pub struct Settings {
@@ -64,6 +106,8 @@ pub struct Settings {
     /// The hand-picked repos to monitor, as `"owner/name"`. Empty until the user
     /// adds some via the repo picker.
     pub watched: Vec<String>,
+    /// When to raise a desktop notification for a finished run.
+    pub notify_on: NotifyOn,
 }
 
 impl Settings {
@@ -94,6 +138,9 @@ impl Settings {
                 .map(str::to_owned)
                 .collect();
         }
+        if let Ok(on) = keyfile.string("notifications", "on") {
+            settings.notify_on = NotifyOn::from_key(&on);
+        }
 
         settings
     }
@@ -104,6 +151,7 @@ impl Settings {
         let keyfile = glib::KeyFile::new();
         keyfile.set_string("appearance", "theme", self.theme.as_key());
         keyfile.set_string("watchlist", "repos", &self.watched.join(","));
+        keyfile.set_string("notifications", "on", self.notify_on.as_key());
 
         let path = config_path();
         if let Some(dir) = path.parent()
@@ -127,4 +175,30 @@ impl Settings {
 
 fn config_path() -> PathBuf {
     glib::user_config_dir().join("pitwall").join("settings.ini")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notify_on_wants_follows_the_policy() {
+        assert!(!NotifyOn::Off.wants(Conclusion::Failure));
+        assert!(NotifyOn::Failures.wants(Conclusion::Failure));
+        assert!(NotifyOn::Failures.wants(Conclusion::TimedOut));
+        assert!(!NotifyOn::Failures.wants(Conclusion::Success));
+        assert!(!NotifyOn::Failures.wants(Conclusion::Cancelled));
+        assert!(NotifyOn::All.wants(Conclusion::Success));
+        assert!(NotifyOn::All.wants(Conclusion::Failure));
+    }
+
+    #[test]
+    fn notify_on_key_round_trips() {
+        for on in [NotifyOn::Off, NotifyOn::Failures, NotifyOn::All] {
+            assert_eq!(NotifyOn::from_key(on.as_key()), on);
+        }
+        // The default (failures) is the headline behaviour and the fallback.
+        assert_eq!(NotifyOn::from_key("bogus"), NotifyOn::Failures);
+        assert_eq!(NotifyOn::default(), NotifyOn::Failures);
+    }
 }

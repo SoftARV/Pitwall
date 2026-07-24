@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 
+use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
 use relm4::actions::{AccelsPlus, RelmAction, RelmActionGroup};
 use relm4::adw::prelude::*;
@@ -32,8 +33,9 @@ use crate::components::run_detail::{RunDetail, RunDetailInit, RunDetailOutput};
 use crate::components::run_row::{RunRow, RunRowInput, RunRowOutput};
 use crate::github::client::{self, ConnectError, Connection, RepoRuns, RunsOutcome};
 use crate::github::types::{Conclusion, RateLimit, WorkflowRun};
+use crate::notify;
 use crate::secret;
-use crate::settings::Settings;
+use crate::settings::{NotifyOn, Settings};
 
 // The primary menu's action group. GTK menu items invoke `GAction`s by name;
 // this defines the "win" group and its stateless actions (fully qualified, e.g.
@@ -43,6 +45,7 @@ relm4::new_action_group!(AppMenuActionGroup, "win");
 relm4::new_stateless_action!(RefreshAction, AppMenuActionGroup, "refresh");
 relm4::new_stateless_action!(EditWatchlistAction, AppMenuActionGroup, "edit-watchlist");
 relm4::new_stateless_action!(SignOutAction, AppMenuActionGroup, "sign-out");
+relm4::new_stateless_action!(PreferencesAction, AppMenuActionGroup, "preferences");
 relm4::new_stateless_action!(AboutAction, AppMenuActionGroup, "about");
 relm4::new_stateless_action!(QuitAction, AppMenuActionGroup, "quit");
 
@@ -131,6 +134,13 @@ pub struct AppModel {
     runs_by_repo: HashMap<String, Vec<WorkflowRun>>,
     /// Per-repo ETag, sent as `If-None-Match` so idle repos answer 304 (free).
     etags: HashMap<String, String>,
+    /// Per finished run, the `(conclusion, updated_at)` we last recorded — how a
+    /// poll detects a run *transitioning* to completed, to notify exactly once.
+    /// The `updated_at` matters because a **re-run keeps the same run id**: only
+    /// its timestamp advances, so comparing it (not mere presence) is what tells a
+    /// re-run's fresh finish from an unchanged one. Seeded silently on the first
+    /// poll (so pre-existing failures don't all alert at startup).
+    last_finished: HashMap<u64, (Conclusion, DateTime<Utc>)>,
     /// The latest rate-limit budget, from the poll's response headers.
     rate: Option<RateLimit>,
     /// Whether a poll has landed since connecting: tells "still loading" apart
@@ -188,6 +198,10 @@ pub enum AppMsg {
     OpenInBrowser(String),
     /// The window became visible / hidden — gates the poll (rule 3).
     SuspendedChanged(bool),
+    /// Open the Preferences dialog (primary menu / Ctrl+,).
+    ShowPreferences,
+    /// The notifications preference changed (from Preferences).
+    SetNotifyOn(NotifyOn),
     /// Open the About dialog (primary menu).
     ShowAbout,
 }
@@ -347,6 +361,93 @@ impl AppModel {
             .collect();
         runs.sort_by_key(|run| std::cmp::Reverse(run.created_at));
         self.all_runs = runs;
+    }
+
+    /// After a poll, fire a notification for each run that has *newly* finished
+    /// (a conclusion we hadn't recorded before) and whose outcome matches the
+    /// user's `NotifyOn` setting. Rebuilds `last_finished` from the current run
+    /// set — which prunes runs that dropped off the list.
+    ///
+    /// `seeding` (the first poll after connecting or a watch-set change) records
+    /// the baseline **without** alerting, so runs already finished before we
+    /// started watching don't all notify at once.
+    fn detect_and_notify(&mut self, seeding: bool) {
+        let notify_on = self.settings.notify_on;
+
+        // Read-only pass: compute the next baseline and collect what to notify,
+        // so we never borrow `self` mutably while iterating `self.all_runs`.
+        let mut next = HashMap::with_capacity(self.all_runs.len());
+        let mut fresh: Vec<(WorkflowRun, Conclusion)> = Vec::new();
+        for run in &self.all_runs {
+            match run.conclusion {
+                // A `Some` conclusion is exactly GitHub's "completed" signal.
+                Some(conclusion) => {
+                    // New to us, or a re-run whose finish is newer than the one we
+                    // last recorded — either way, a fresh completion.
+                    let is_new = match self.last_finished.get(&run.id) {
+                        None => true,
+                        Some(&(_, seen_at)) => run.updated_at > seen_at,
+                    };
+                    next.insert(run.id, (conclusion, run.updated_at));
+                    if !seeding && is_new && notify_on.wants(conclusion) {
+                        fresh.push((run.clone(), conclusion));
+                    }
+                }
+                // Still running/queued: carry forward any prior finish so a fast
+                // re-run (finishing between two polls, before we ever see it as
+                // running) is still caught — its `updated_at` will have advanced.
+                None => {
+                    if let Some(&prev) = self.last_finished.get(&run.id) {
+                        next.insert(run.id, prev);
+                    }
+                }
+            }
+        }
+
+        self.last_finished = next;
+        for (run, conclusion) in fresh {
+            tracing::debug!(run = run.id, ?conclusion, "run finished → notifying");
+            notify::notify_finished(&run, conclusion);
+        }
+    }
+
+    /// Present the Preferences dialog. Built imperatively and *presented* over the
+    /// window (like the About dialog), so it isn't in the widget tree; the combo
+    /// posts `SetNotifyOn` on change. (The poll interval and theme land here in
+    /// M7 — this is the group they'll join.)
+    fn present_preferences(&self, sender: &ComponentSender<Self>, root: &adw::ApplicationWindow) {
+        let group = adw::PreferencesGroup::builder()
+            .title("Notifications")
+            .description("Desktop alerts when a watched run finishes.")
+            .build();
+
+        let combo = adw::ComboRow::builder().title("Notify me").build();
+        combo.set_model(Some(&gtk::StringList::new(&[
+            "Off",
+            "Failures only",
+            "Every run",
+        ])));
+        combo.set_selected(match self.settings.notify_on {
+            NotifyOn::Off => 0,
+            NotifyOn::Failures => 1,
+            NotifyOn::All => 2,
+        });
+        let combo_sender = sender.input_sender().clone();
+        combo.connect_selected_notify(move |row| {
+            let on = match row.selected() {
+                0 => NotifyOn::Off,
+                2 => NotifyOn::All,
+                _ => NotifyOn::Failures,
+            };
+            combo_sender.send(AppMsg::SetNotifyOn(on)).ok();
+        });
+        group.add(&combo);
+
+        let page = adw::PreferencesPage::new();
+        page.add(&group);
+        let dialog = adw::PreferencesDialog::new();
+        dialog.add(&page);
+        dialog.present(Some(root));
     }
 
     /// Fire off a conditional run poll across the watched repos, off-thread.
@@ -563,6 +664,7 @@ impl AppModel {
         self.runs_by_repo.clear();
         self.etags.clear();
         self.all_runs.clear();
+        self.last_finished.clear();
         self.runs.guard().clear();
         self.runs_loaded = false;
         self.set_signed_in(true);
@@ -807,6 +909,7 @@ impl Component for AppModel {
             all_runs: Vec::new(),
             runs_by_repo: HashMap::new(),
             etags: HashMap::new(),
+            last_finished: HashMap::new(),
             rate: None,
             runs_loaded: false,
             refreshing: false,
@@ -840,6 +943,7 @@ impl Component for AppModel {
         account.append_item(&signout_item);
         menu.append_section(None, &account);
         let app_section = gio::Menu::new();
+        app_section.append(Some("Preferences"), Some("win.preferences"));
         app_section.append(Some("About Pitwall"), Some("win.about"));
         app_section.append(Some("Quit"), Some("win.quit"));
         menu.append_section(None, &app_section);
@@ -863,6 +967,11 @@ impl Component for AppModel {
         });
 
         // Menu actions — thin bridges to `AppMsg` (Quit acts directly).
+        let prefs_sender = sender.input_sender().clone();
+        let preferences_action: RelmAction<PreferencesAction> =
+            RelmAction::new_stateless(move |_| {
+                prefs_sender.send(AppMsg::ShowPreferences).ok();
+            });
         let about_sender = sender.input_sender().clone();
         let about_action: RelmAction<AboutAction> = RelmAction::new_stateless(move |_| {
             about_sender.send(AppMsg::ShowAbout).ok();
@@ -875,6 +984,7 @@ impl Component for AppModel {
         group.add_action(signout_action);
         group.add_action(editwatch_action);
         group.add_action(refresh_action);
+        group.add_action(preferences_action);
         group.add_action(about_action);
         group.add_action(quit_action);
         group.register_for_widget(&root);
@@ -882,6 +992,23 @@ impl Component for AppModel {
         let app = relm4::main_application();
         app.set_accelerators_for_action::<QuitAction>(&["<primary>q"]);
         app.set_accelerators_for_action::<RefreshAction>(&["<primary>r", "F5"]);
+        app.set_accelerators_for_action::<PreferencesAction>(&["<primary>comma"]);
+
+        // A notification click opens the run on github.com. This is an *app*-scoped
+        // action (`app.open-run`), not a `win.` one: GNOME activates a
+        // notification's action on the application, which may be reached while the
+        // window is backgrounded. The run's URL rides in as the string target.
+        let open_run = gio::SimpleAction::new("open-run", Some(glib::VariantTy::STRING));
+        open_run.connect_activate(|_, param| {
+            if let Some(url) = param.and_then(|value| value.get::<String>()) {
+                gtk::UriLauncher::new(&url).launch(
+                    gtk::Window::NONE,
+                    gio::Cancellable::NONE,
+                    |_result| {},
+                );
+            }
+        });
+        app.add_action(&open_run);
 
         // Let GTK tell us when the window isn't worth polling for — minimised,
         // fully obscured, or on another workspace all count as "suspended".
@@ -1138,6 +1265,15 @@ impl Component for AppModel {
                 Self::dispatch_boot(&sender);
             }
 
+            AppMsg::ShowPreferences => {
+                self.present_preferences(&sender, root);
+            }
+
+            AppMsg::SetNotifyOn(on) => {
+                self.settings.notify_on = on;
+                self.settings.save();
+            }
+
             AppMsg::ShowAbout => {
                 let about = adw::AboutDialog::builder()
                     .application_name("Pitwall")
@@ -1296,6 +1432,9 @@ impl Component for AppModel {
                 }
 
                 self.rebuild_runs();
+                // Notify on newly-finished runs before flipping `runs_loaded`:
+                // the first poll only seeds the baseline (no startup alert spam).
+                self.detect_and_notify(!self.runs_loaded);
                 self.runs_loaded = true;
                 self.apply_runs();
             }
