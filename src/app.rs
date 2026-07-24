@@ -43,6 +43,7 @@ use crate::settings::{MAX_POLL_INTERVAL, MIN_POLL_INTERVAL, NotifyOn, Settings, 
 // action bridges to an `AppMsg` (except Quit, which acts directly).
 relm4::new_action_group!(AppMenuActionGroup, "win");
 relm4::new_stateless_action!(RefreshAction, AppMenuActionGroup, "refresh");
+relm4::new_stateless_action!(SearchAction, AppMenuActionGroup, "search");
 relm4::new_stateless_action!(EditWatchlistAction, AppMenuActionGroup, "edit-watchlist");
 relm4::new_stateless_action!(SignOutAction, AppMenuActionGroup, "sign-out");
 relm4::new_stateless_action!(PreferencesAction, AppMenuActionGroup, "preferences");
@@ -195,6 +196,9 @@ pub struct AppModel {
     refreshing: bool,
     /// The poll timer, while running. Removed outright when the window is hidden.
     poll: Option<glib::SourceId>,
+    /// The current search text; filters the visible list by repo / workflow /
+    /// branch, client-side. Empty means "show everything".
+    query: String,
     /// The "Sign Out", "Edit Watchlist", and "Refresh" menu actions — all
     /// `hidden-when="action-disabled"`, so they show (and act) only when signed
     /// in; disabling *hides* them rather than greying them.
@@ -220,6 +224,8 @@ pub enum AppMsg {
     EditWatchlist,
     /// The picker saved a new watch set.
     WatchlistSaved(Vec<String>),
+    /// The search text changed — re-filter the list.
+    SearchChanged(String),
     /// "Try Again" on the disconnected page — re-run the startup connect.
     Retry,
     /// The background poll tick (silent) — reload the runs.
@@ -348,8 +354,9 @@ impl AppModel {
         self.refresh_action.set_enabled(signed_in);
     }
 
-    /// Which `app` sub-page to show: no repos, first-load spinner, no runs, or
-    /// the list.
+    /// Which `app` sub-page to show: no repos, first-load spinner, no runs, no
+    /// search matches, or the list. `runs` reflects the *filtered* set, so an
+    /// empty one with runs present means the query matched nothing.
     fn app_page(&self) -> &'static str {
         if self.watched.is_empty() {
             "no-repos"
@@ -357,9 +364,36 @@ impl AppModel {
             "loading"
         } else if self.all_runs.is_empty() {
             "no-runs"
+        } else if self.runs.is_empty() {
+            "no-results"
         } else {
             "runs"
         }
+    }
+
+    /// Whether the search affordance should show — only once we're connected with
+    /// runs to actually filter.
+    fn searchable(&self) -> bool {
+        matches!(self.state, ViewState::Ready) && self.runs_loaded && !self.all_runs.is_empty()
+    }
+
+    /// The runs matching the current search, newest-first order preserved. A
+    /// case-insensitive substring match on repo / workflow / branch — the fields
+    /// a glance would scan for. Empty query passes everything through.
+    fn filtered_runs(&self) -> Vec<WorkflowRun> {
+        if self.query.trim().is_empty() {
+            return self.all_runs.clone();
+        }
+        let needle = self.query.to_lowercase();
+        self.all_runs
+            .iter()
+            .filter(|run| {
+                run.repo.to_lowercase().contains(&needle)
+                    || run.workflow_name.to_lowercase().contains(&needle)
+                    || run.head_branch.to_lowercase().contains(&needle)
+            })
+            .cloned()
+            .collect()
     }
 
     /// Start the poll, unless it's already running or there's nothing to poll.
@@ -727,7 +761,7 @@ impl AppModel {
     /// set is unchanged, rebuild only when membership changes (rule 7). The clone
     /// avoids a simultaneous borrow of `self.all_runs` and `self.runs`.
     fn apply_runs(&mut self) {
-        let target = self.all_runs.clone();
+        let target = self.filtered_runs();
         let unchanged = self.runs.len() == target.len()
             && self
                 .runs
@@ -973,6 +1007,16 @@ impl Component for AppModel {
                             set_subtitle: &model.header_subtitle(),
                         },
 
+                        // Toggles the search bar; two-way bound to it in `init`.
+                        // Shown only when there are runs to filter.
+                        #[name = "search_button"]
+                        pack_start = &gtk::ToggleButton {
+                            set_icon_name: "system-search-symbolic",
+                            set_tooltip_text: Some("Search runs (Ctrl+F)"),
+                            #[watch]
+                            set_visible: model.searchable(),
+                        },
+
                         // The menu model is built imperatively in `init` (so the
                         // Sign Out item can carry `hidden-when="action-disabled"`)
                         // and set on this button there.
@@ -990,6 +1034,21 @@ impl Component for AppModel {
                             #[watch]
                             set_spinning: model.refreshing,
                             set_valign: gtk::Align::Center,
+                        },
+                    },
+
+                    // Client-side filter over the run list. Wired to the header
+                    // toggle + Ctrl+F in `init`; its entry posts `SearchChanged`.
+                    #[name = "search_bar"]
+                    add_top_bar = &gtk::SearchBar {
+                        #[wrap(Some)]
+                        #[name = "search_entry"]
+                        set_child = &gtk::SearchEntry {
+                            set_placeholder_text: Some("Filter by repo, workflow, or branch"),
+                            set_hexpand: true,
+                            connect_search_changed[sender] => move |entry| {
+                                sender.input(AppMsg::SearchChanged(entry.text().to_string()));
+                            },
                         },
                     },
 
@@ -1061,6 +1120,15 @@ impl Component for AppModel {
                                 set_title: "No runs yet",
                                 set_description: Some(
                                     "Workflow runs in your watched repositories will appear here.",
+                                ),
+                            },
+
+                            add_named[Some("no-results")] = &adw::StatusPage {
+                                set_icon_name: Some("edit-find-symbolic"),
+                                set_title: "No matching runs",
+                                set_description: Some(
+                                    "No runs match your search. Try a different repo, \
+                                     workflow, or branch.",
                                 ),
                             },
 
@@ -1173,6 +1241,7 @@ impl Component for AppModel {
             runs_loaded: false,
             refreshing: false,
             poll: None,
+            query: String::new(),
             signout_action: signout_action.gio_action().clone(),
             editwatch_action: editwatch_action.gio_action().clone(),
             refresh_action: refresh_action.gio_action().clone(),
@@ -1184,6 +1253,26 @@ impl Component for AppModel {
         let runs_group = model.runs.widget();
 
         let widgets = view_output!();
+
+        // Wire the search bar: the header toggle drives it two-way, and typing
+        // anywhere in the window opens it and starts filtering.
+        widgets
+            .search_button
+            .bind_property("active", &widgets.search_bar, "search-mode-enabled")
+            .bidirectional()
+            .sync_create()
+            .build();
+        widgets.search_bar.set_key_capture_widget(Some(&root));
+        // Closing the bar clears the filter, so the list doesn't stay narrowed
+        // with no visible search box. Clearing the entry posts `SearchChanged("")`.
+        let search_entry = widgets.search_entry.clone();
+        widgets
+            .search_bar
+            .connect_notify_local(Some("search-mode-enabled"), move |bar, _| {
+                if !bar.is_search_mode() {
+                    search_entry.set_text("");
+                }
+            });
 
         // The primary menu, built by hand so Sign Out can carry the `hidden-when`
         // attribute the `menu!` macro doesn't expose.
@@ -1225,6 +1314,14 @@ impl Component for AppModel {
             popped.send(AppMsg::DetailClosed).ok();
         });
 
+        // Ctrl+F toggles the search: flip the header button, which the property
+        // binding carries to the search bar. Captures the button widget, so it
+        // needs no reducer round-trip.
+        let search_button = widgets.search_button.clone();
+        let search_action: RelmAction<SearchAction> = RelmAction::new_stateless(move |_| {
+            search_button.set_active(!search_button.is_active());
+        });
+
         // Menu actions — thin bridges to `AppMsg` (Quit acts directly).
         let prefs_sender = sender.input_sender().clone();
         let preferences_action: RelmAction<PreferencesAction> =
@@ -1243,6 +1340,7 @@ impl Component for AppModel {
         group.add_action(signout_action);
         group.add_action(editwatch_action);
         group.add_action(refresh_action);
+        group.add_action(search_action);
         group.add_action(preferences_action);
         group.add_action(about_action);
         group.add_action(quit_action);
@@ -1251,6 +1349,7 @@ impl Component for AppModel {
         let app = relm4::main_application();
         app.set_accelerators_for_action::<QuitAction>(&["<primary>q"]);
         app.set_accelerators_for_action::<RefreshAction>(&["<primary>r", "F5"]);
+        app.set_accelerators_for_action::<SearchAction>(&["<primary>f"]);
         app.set_accelerators_for_action::<PreferencesAction>(&["<primary>comma"]);
 
         // A notification click opens the run on github.com. This is an *app*-scoped
@@ -1435,6 +1534,13 @@ impl Component for AppModel {
                 self.stop_poll();
                 self.start_poll(&sender);
                 self.dispatch_refresh(&sender);
+            }
+
+            AppMsg::SearchChanged(query) => {
+                self.query = query;
+                // Re-filter into the visible rows; `app_page` (via `#[watch]`)
+                // then swaps to the no-results page when nothing matches.
+                self.apply_runs();
             }
 
             AppMsg::Refresh => {
