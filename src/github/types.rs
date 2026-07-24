@@ -245,6 +245,8 @@ impl Job {
 #[derive(Debug, Clone)]
 pub struct Step {
     pub name: String,
+    /// 1-based order within the job — the key to the step's file in the log zip.
+    pub number: i64,
     pub status: RunStatus,
     pub conclusion: Option<Conclusion>,
     pub started_at: Option<DateTime<Utc>>,
@@ -255,6 +257,7 @@ impl Step {
     pub fn from_model(step: ApiStep) -> Self {
         Self {
             name: step.name,
+            number: step.number,
             status: RunStatus::from_status(&step.status),
             conclusion: step.conclusion.map(|c| Conclusion::from_conclusion(&c)),
             started_at: step.started_at,

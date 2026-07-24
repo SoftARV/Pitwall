@@ -8,6 +8,7 @@
 //! types are mapped into ours (`RateLimit`) before leaving this module.
 
 use std::collections::HashMap;
+use std::io::{Cursor, Read};
 
 use chrono::DateTime;
 use http::header::{ACCEPT, ETAG, IF_NONE_MATCH};
@@ -291,6 +292,148 @@ pub async fn list_jobs(
         .await
         .map_err(|err| diagnose(err).message().to_owned())?;
     Ok(page.items.into_iter().map(Job::from_model).collect())
+}
+
+/// Fetch and clean one step's log.
+///
+/// There's no per-step (or even per-job, from octocrab) log endpoint — only the
+/// run-level **zip** of every job's logs. So we download that and pull out the
+/// step's file (`‹job›/‹number›_‹step›.txt`). For now this re-downloads per view;
+/// caching the zip per run is a follow-up once we've measured real sizes.
+pub async fn fetch_step_log(
+    octocrab: &Octocrab,
+    owner: &str,
+    repo: &str,
+    run_id: u64,
+    job_name: &str,
+    step_number: i64,
+    step_name: &str,
+) -> Result<String, String> {
+    let bytes = octocrab
+        .actions()
+        .download_workflow_run_logs(owner, repo, octocrab::models::RunId(run_id))
+        .await
+        .map_err(|err| diagnose(err).message().to_owned())?;
+    extract_step_log(bytes.as_ref(), job_name, step_number, step_name)
+}
+
+/// Find and read a step's file inside the run-log zip, then clean it.
+///
+/// GitHub sanitises the names in the archive, so we match on a normalised job
+/// folder plus the `‹number›_` filename prefix (unique within a job), with a
+/// looser step-name fallback for when the folder name doesn't survive
+/// normalisation.
+fn extract_step_log(
+    zip_bytes: &[u8],
+    job_name: &str,
+    step_number: i64,
+    step_name: &str,
+) -> Result<String, String> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes))
+        .map_err(|err| format!("couldn't open the log archive: {err}"))?;
+
+    let prefix = format!("{step_number}_");
+    let job_key = normalize(job_name);
+    let step_key = normalize(step_name);
+
+    let mut exact = None;
+    let mut fallback = None;
+    for i in 0..archive.len() {
+        let Ok(entry) = archive.by_index(i) else {
+            continue;
+        };
+        let name = entry.name().to_owned();
+        let Some((folder, file)) = name.rsplit_once('/') else {
+            continue;
+        };
+        if !file.starts_with(&prefix) {
+            continue;
+        }
+        if normalize(folder) == job_key {
+            exact = Some(i);
+            break;
+        }
+        if normalize(file).contains(&step_key) {
+            fallback = fallback.or(Some(i));
+        }
+    }
+
+    let index = exact.or(fallback).ok_or_else(|| {
+        "couldn't find this step's log in the archive — open it in the browser instead".to_owned()
+    })?;
+
+    let mut entry = archive
+        .by_index(index)
+        .map_err(|err| format!("couldn't read the step log: {err}"))?;
+    let mut raw = String::new();
+    entry
+        .read_to_string(&mut raw)
+        .map_err(|err| format!("couldn't read the step log: {err}"))?;
+    Ok(clean_log(&raw))
+}
+
+/// Lowercase alphanumerics only — for fuzzy-matching zip names against the API's
+/// job/step names despite GitHub's filename sanitisation.
+fn normalize(name: &str) -> String {
+    name.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Turn a raw runner log into readable text: drop each line's leading ISO
+/// timestamp, strip ANSI colour escapes, and unwrap the `##[…]` grouping markers.
+fn clean_log(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for raw_line in raw.lines() {
+        let line = strip_ansi(strip_timestamp(raw_line));
+        let line = line.trim_start();
+        if line == "##[endgroup]" {
+            continue;
+        }
+        let line = line
+            .strip_prefix("##[group]")
+            .or_else(|| line.strip_prefix("##[command]"))
+            .or_else(|| line.strip_prefix("##[section]"))
+            .unwrap_or(line);
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Drop a `2026-07-24T14:30:01.12Z ` timestamp prefix, if present.
+fn strip_timestamp(line: &str) -> &str {
+    if let Some((first, rest)) = line.split_once(' ')
+        && first.len() >= 20
+        && first.ends_with('Z')
+        && first.as_bytes().get(4) == Some(&b'-')
+    {
+        return rest;
+    }
+    line
+}
+
+/// Remove ANSI CSI escape sequences (`\e[…m` and friends).
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // ESC: skip a CSI sequence — `[`, params, then a final letter.
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Step 1 of the device flow: ask GitHub for a user code. The returned

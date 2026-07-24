@@ -43,5 +43,10 @@ chrono = "0.4"
 http = "1"
 secrecy = "0.10"
 
+# Job logs come only as a run-level zip (there's no per-step endpoint); we unzip
+# it in memory to pull out one step's file. `deflate` is the only compression
+# GitHub's log archives use, so the other codecs (and their C deps) stay off.
+zip = { version = "8", default-features = false, features = ["deflate"] }
+
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

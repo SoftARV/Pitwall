@@ -26,6 +26,7 @@ use relm4::{
     adw, gtk,
 };
 
+use crate::components::log_view::{LogView, LogViewInit, LogViewOutput};
 use crate::components::repo_picker::{RepoPicker, RepoPickerInit, RepoPickerOutput};
 use crate::components::run_detail::{RunDetail, RunDetailInit, RunDetailOutput};
 use crate::components::run_row::{RunRow, RunRowInput, RunRowOutput};
@@ -116,6 +117,8 @@ pub struct AppModel {
     /// The run detail page, while one is open. Holding the `Controller` keeps it
     /// (and its jobs fetch) alive; dropping it on navigate-back shuts it down.
     detail: Option<Controller<RunDetail>>,
+    /// The step-log page, while one is open (pushed on top of the detail).
+    log_view: Option<Controller<LogView>>,
     /// The watched repos as `owner/name`, mirrored from settings for the view.
     watched: Vec<String>,
     /// The visible run rows, reconciled in place from `all_runs` (rule 7).
@@ -171,7 +174,17 @@ pub enum AppMsg {
     ManualRefresh,
     /// Open a run's native detail page (a row was activated).
     ShowDetails(u64),
-    /// The detail page was popped (back / Escape) — drop its controller.
+    /// Open a step's log page (a step was activated in the detail).
+    ShowStepLog {
+        repo: String,
+        run_id: u64,
+        job_name: String,
+        step_number: i64,
+        step_name: String,
+        completed: bool,
+        html_url: String,
+    },
+    /// A pushed page was popped (back / Escape) — drop the top-most controller.
     DetailClosed,
     /// Open a run on github.com (the row's browser button).
     OpenInBrowser(String),
@@ -791,6 +804,7 @@ impl Component for AppModel {
             repo_picker: None,
             nav: adw::NavigationView::new(),
             detail: None,
+            log_view: None,
             runs,
             all_runs: Vec::new(),
             runs_by_repo: HashMap::new(),
@@ -1054,13 +1068,66 @@ impl Component for AppModel {
                     })
                     .forward(sender.input_sender(), |output| match output {
                         RunDetailOutput::OpenInBrowser(url) => AppMsg::OpenInBrowser(url),
+                        RunDetailOutput::ShowStepLog {
+                            repo,
+                            run_id,
+                            job_name,
+                            step_number,
+                            step_name,
+                            completed,
+                            html_url,
+                        } => AppMsg::ShowStepLog {
+                            repo,
+                            run_id,
+                            job_name,
+                            step_number,
+                            step_name,
+                            completed,
+                            html_url,
+                        },
                     });
                 self.nav.push(controller.widget());
                 self.detail = Some(controller);
             }
 
+            AppMsg::ShowStepLog {
+                repo,
+                run_id,
+                job_name,
+                step_number,
+                step_name,
+                completed,
+                html_url,
+            } => {
+                let Some(connection) = &self.connection else {
+                    return;
+                };
+                let controller = LogView::builder()
+                    .launch(LogViewInit {
+                        octocrab: connection.octocrab.clone(),
+                        repo,
+                        run_id,
+                        job_name,
+                        step_number,
+                        step_name,
+                        completed,
+                        html_url,
+                    })
+                    .forward(sender.input_sender(), |output| match output {
+                        LogViewOutput::OpenInBrowser(url) => AppMsg::OpenInBrowser(url),
+                    });
+                self.nav.push(controller.widget());
+                self.log_view = Some(controller);
+            }
+
             AppMsg::DetailClosed => {
-                self.detail = None;
+                // Pops happen top-down: a log page (if any) sits above the detail,
+                // so drop it first; the next pop drops the detail.
+                if self.log_view.is_some() {
+                    self.log_view = None;
+                } else {
+                    self.detail = None;
+                }
             }
 
             AppMsg::SuspendedChanged(suspended) => {

@@ -46,6 +46,17 @@ enum JobsState {
 pub enum RunDetailOutput {
     /// Open this run on github.com (the header button).
     OpenInBrowser(String),
+    /// A step was activated — open its log page. Carries everything the log
+    /// view needs to fetch (and locate the step in the run's log zip).
+    ShowStepLog {
+        repo: String,
+        run_id: u64,
+        job_name: String,
+        step_number: i64,
+        step_name: String,
+        completed: bool,
+        html_url: String,
+    },
 }
 
 #[derive(Debug)]
@@ -99,7 +110,8 @@ impl RunDetail {
     /// Fill the jobs group with one expandable row per job, each expanding to its
     /// steps. Built imperatively (dynamic count); the chips use the shared
     /// `status_chip::build`. Called once, so there's nothing to clear first.
-    fn populate_jobs(&self, jobs: &[Job]) {
+    /// Activating a step emits `ShowStepLog` so the app can push its log page.
+    fn populate_jobs(&self, jobs: &[Job], sender: &ComponentSender<Self>) {
         for job in jobs {
             let row = adw::ExpanderRow::new();
             row.set_title(&job.name);
@@ -111,6 +123,32 @@ impl RunDetail {
                 step_row.set_title(&step.name);
                 step_row.set_subtitle(&step_duration(step));
                 step_row.add_prefix(&status_chip::build(step.status, step.conclusion));
+
+                // Click a step to open its log. The coordinates are captured as
+                // owned values and re-cloned per activation (the closure is `Fn`).
+                step_row.set_activatable(true);
+                let output = sender.output_sender().clone();
+                let repo = self.run.repo.clone();
+                let job_name = job.name.clone();
+                let step_name = step.name.clone();
+                let html_url = self.run.html_url.clone();
+                let run_id = self.run.id;
+                let step_number = step.number;
+                let completed = step.status == RunStatus::Completed;
+                step_row.connect_activated(move |_| {
+                    output
+                        .send(RunDetailOutput::ShowStepLog {
+                            repo: repo.clone(),
+                            run_id,
+                            job_name: job_name.clone(),
+                            step_number,
+                            step_name: step_name.clone(),
+                            completed,
+                            html_url: html_url.clone(),
+                        })
+                        .ok();
+                });
+
                 row.add_row(&step_row);
             }
             self.jobs_group.add(&row);
@@ -271,13 +309,13 @@ impl Component for RunDetail {
     fn update_cmd(
         &mut self,
         msg: Self::CommandOutput,
-        _sender: ComponentSender<Self>,
+        sender: ComponentSender<Self>,
         _root: &Self::Root,
     ) {
         match msg {
             RunDetailCmd::JobsLoaded(result) => match *result {
                 Ok(jobs) => {
-                    self.populate_jobs(&jobs);
+                    self.populate_jobs(&jobs, &sender);
                     self.state = JobsState::Loaded;
                 }
                 Err(message) => {
