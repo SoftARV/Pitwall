@@ -13,7 +13,7 @@ use relm4::factory::{DynamicIndex, FactoryComponent, FactorySender};
 use relm4::{adw, gtk};
 
 use crate::components::status_chip::{self, StatusChip};
-use crate::github::types::WorkflowRun;
+use crate::github::types::{RunStatus, WorkflowRun};
 
 #[derive(Debug)]
 pub enum RunRowOutput {
@@ -53,6 +53,44 @@ impl RunRow {
             self.run.event,
             relative(self.run.created_at),
         )
+    }
+}
+
+/// The primary run-action button's look and target action, by run state: cancel
+/// while it's running, re-run once it's finished. Shared by the list row and the
+/// detail page so both read identically. Each button binds directly to the shared
+/// "runs" action (registered on the window in `app`) with the run id as its
+/// target — one click, no menu. (Re-run-*failed* is a detail-page extra.)
+pub(crate) struct RunActionSpec {
+    pub icon: &'static str,
+    pub label: &'static str,
+    pub action: &'static str,
+    /// False while the run is already cancelling — the button shows the state but
+    /// can't be re-clicked.
+    pub enabled: bool,
+}
+
+pub(crate) fn run_action_spec(status: RunStatus) -> RunActionSpec {
+    match status {
+        // Already cancelling: show it, but disabled — there's nothing more to do.
+        RunStatus::Cancelling => RunActionSpec {
+            icon: "process-stop-symbolic",
+            label: "Cancelling…",
+            action: "runs.cancel",
+            enabled: false,
+        },
+        status if status.is_active() => RunActionSpec {
+            icon: "process-stop-symbolic",
+            label: "Cancel",
+            action: "runs.cancel",
+            enabled: true,
+        },
+        _ => RunActionSpec {
+            icon: "view-refresh-symbolic",
+            label: "Re-run",
+            action: "runs.rerun",
+            enabled: true,
+        },
     }
 }
 
@@ -109,6 +147,26 @@ impl FactoryComponent for RunRow {
                     #[watch]
                     set_label: status_chip::label(self.run.status, self.run.conclusion),
                 },
+            },
+
+            // A single-click primary action — cancel while running, re-run once
+            // finished — bound straight to the shared "runs" action. Icon-only in
+            // the compact list; the detail page gives it a label.
+            add_suffix = &gtk::Button {
+                set_valign: gtk::Align::Center,
+                add_css_class: "flat",
+                #[watch]
+                set_icon_name: run_action_spec(self.run.status).icon,
+                #[watch]
+                set_tooltip_text: Some(run_action_spec(self.run.status).label),
+                // `set_action_name` clears the target, so re-apply the id after it.
+                #[watch]
+                set_action_name: Some(run_action_spec(self.run.status).action),
+                #[watch]
+                set_action_target_value: Some(&self.run.id.to_variant()),
+                // After the action binding, so it wins: disable while cancelling.
+                #[watch]
+                set_sensitive: run_action_spec(self.run.status).enabled,
             },
 
             // Opens the run on github.com; activating the row itself opens the

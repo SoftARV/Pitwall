@@ -330,6 +330,78 @@ pub async fn fetch_job_log(
         .map_err(|err| diagnose(err).message().to_owned())
 }
 
+/// Re-run **all** of a run's jobs. octocrab 0.54 has no helper for this endpoint
+/// (only `cancel_workflow_run`), so it's a raw `POST` — verified against the
+/// REST docs, not memory (rule 1). GitHub answers `201 Created` on success.
+pub async fn rerun_run(
+    octocrab: &Octocrab,
+    owner: &str,
+    repo: &str,
+    run_id: u64,
+) -> Result<(), String> {
+    post_action(
+        octocrab,
+        format!("/repos/{owner}/{repo}/actions/runs/{run_id}/rerun"),
+    )
+    .await
+}
+
+/// Re-run only a run's **failed** jobs (and anything downstream of them). Same
+/// raw-`POST` shape as [`rerun_run`], different endpoint.
+pub async fn rerun_failed_jobs(
+    octocrab: &Octocrab,
+    owner: &str,
+    repo: &str,
+    run_id: u64,
+) -> Result<(), String> {
+    post_action(
+        octocrab,
+        format!("/repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs"),
+    )
+    .await
+}
+
+/// Cancel an in-progress run. This one *does* have an octocrab helper.
+pub async fn cancel_run(
+    octocrab: &Octocrab,
+    owner: &str,
+    repo: &str,
+    run_id: u64,
+) -> Result<(), String> {
+    octocrab
+        .actions()
+        .cancel_workflow_run(owner, repo, run_id.into())
+        .await
+        .map_err(|err| diagnose(err).message().to_owned())
+}
+
+/// `POST` an action endpoint that takes no body and returns no data. `_post`
+/// yields the raw response (it doesn't error on a 4xx), so we check the status
+/// and name the fix ourselves — the same contract the read paths use (rule 2).
+async fn post_action(octocrab: &Octocrab, uri: String) -> Result<(), String> {
+    let response = octocrab
+        ._post(uri, None::<&()>)
+        .await
+        .map_err(|err| diagnose(err).message().to_owned())?;
+    let status = response.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        Err(action_error(status))
+    }
+}
+
+/// A run-action failure message that names the fix (rule 2).
+fn action_error(status: http::StatusCode) -> String {
+    match status.as_u16() {
+        401 => "Sign in again — GitHub rejected the token.".to_owned(),
+        403 => "Not allowed — the token may lack permission, or you're rate-limited.".to_owned(),
+        404 => "That run is gone, or you don't have access to it.".to_owned(),
+        409 => "The run isn't in a state that allows that action.".to_owned(),
+        code => format!("GitHub returned HTTP {code}."),
+    }
+}
+
 /// Step 1 of the device flow: ask GitHub for a user code. The returned
 /// `DeviceFlow` carries the code to show the user and the handle to poll with.
 ///

@@ -8,9 +8,13 @@
 //! the list), then fetches its jobs once and lists each as an expandable row of
 //! steps. octocrab is used only to fetch; the UI sees our types (rule 4).
 //!
-//! Jobs are fetched once, on open — not polled. A run still in progress is a
-//! snapshot; reopen (or "Open in Browser") for live state. Live job polling is a
-//! deliberate later refinement.
+//! The page stays live while it's open: the app forwards a `Refresh` (the latest
+//! run + a re-fetch of its jobs) on every poll and after a run action, so the
+//! metadata and jobs track reality the same way the list does. Jobs are rebuilt
+//! only when they actually change, and expanded rows stay expanded across a
+//! refresh.
+
+use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use relm4::adw::prelude::*;
@@ -18,9 +22,10 @@ use relm4::{Component, ComponentParts, ComponentSender, RelmWidgetExt, adw, gtk}
 
 use octocrab::Octocrab;
 
+use crate::components::run_row::run_action_spec;
 use crate::components::status_chip::{self, StatusChip};
 use crate::github::client;
-use crate::github::types::{Job, RunStatus, Step, WorkflowRun};
+use crate::github::types::{Conclusion, Job, RunStatus, Step, WorkflowRun};
 
 pub struct RunDetailInit {
     pub octocrab: Octocrab,
@@ -30,9 +35,24 @@ pub struct RunDetailInit {
 pub struct RunDetail {
     run: WorkflowRun,
     state: JobsState,
+    /// Kept so refreshes can re-fetch without the app re-plumbing it (Arc-backed,
+    /// so the clone is a pointer bump).
+    octocrab: Octocrab,
     /// Held so the load handler can fill it once the jobs arrive — it's built
     /// empty and populated imperatively (the rows are dynamic).
     jobs_group: adw::PreferencesGroup,
+    /// The jobs currently shown — a refresh rebuilds only when this changes.
+    jobs: Vec<Job>,
+    /// The built job rows (by job name), for clearing on rebuild and for
+    /// preserving which were expanded across it.
+    job_rows: Vec<(String, adw::ExpanderRow)>,
+}
+
+#[derive(Debug)]
+pub enum RunDetailInput {
+    /// Fresh run data plus a trigger to re-fetch its jobs — sent by the app on
+    /// each poll and after a run action, to keep this page live.
+    Refresh(Box<WorkflowRun>),
 }
 
 #[derive(Debug)]
@@ -107,16 +127,43 @@ impl RunDetail {
         }
     }
 
-    /// Fill the jobs group with one expandable row per job, each expanding to its
-    /// steps. Built imperatively (dynamic count); the chips use the shared
-    /// `status_chip::build`. Called once, so there's nothing to clear first.
+    /// Re-fetch this run's jobs off-thread; the result lands as `JobsLoaded`.
+    /// Shared by the initial load and every refresh.
+    fn fetch_jobs(&self, sender: &ComponentSender<Self>) {
+        let octocrab = self.octocrab.clone();
+        let repo = self.run.repo.clone();
+        let run_id = self.run.id;
+        sender.oneshot_command(async move {
+            let outcome = match repo.split_once('/') {
+                Some((owner, name)) => client::list_jobs(&octocrab, owner, name, run_id).await,
+                None => Err(format!("“{repo}” isn't a valid owner/name")),
+            };
+            RunDetailCmd::JobsLoaded(Box::new(outcome))
+        });
+    }
+
+    /// Rebuild the jobs group: one expandable row per job, each expanding to its
+    /// steps. On a refresh the previous rows are removed first and their expanded
+    /// state restored by job name, so watching a job's steps isn't interrupted.
     /// Each job's "View log" button emits `ShowJobLog` so the app can push its
     /// log page.
-    fn populate_jobs(&self, jobs: &[Job], sender: &ComponentSender<Self>) {
+    fn populate_jobs(&mut self, jobs: &[Job], sender: &ComponentSender<Self>) {
+        // Remember which jobs the user had expanded, then clear the old rows.
+        let expanded: HashSet<String> = self
+            .job_rows
+            .iter()
+            .filter(|(_, row)| row.is_expanded())
+            .map(|(name, _)| name.clone())
+            .collect();
+        for (_, row) in self.job_rows.drain(..) {
+            self.jobs_group.remove(&row);
+        }
+
         for job in jobs {
             let row = adw::ExpanderRow::new();
             row.set_title(&job.name);
             row.set_subtitle(&job_duration(job));
+            row.set_expanded(expanded.contains(&job.name));
 
             // "View log" opens the whole job's log. It's a plain button, so
             // clicking it doesn't toggle the expander — only the row's title area
@@ -154,6 +201,7 @@ impl RunDetail {
                 row.add_row(&step_row);
             }
             self.jobs_group.add(&row);
+            self.job_rows.push((job.name.clone(), row));
         }
     }
 }
@@ -161,7 +209,7 @@ impl RunDetail {
 #[relm4::component(pub)]
 impl Component for RunDetail {
     type Init = RunDetailInit;
-    type Input = ();
+    type Input = RunDetailInput;
     type Output = RunDetailOutput;
     type CommandOutput = RunDetailCmd;
 
@@ -173,6 +221,42 @@ impl Component for RunDetail {
             adw::ToolbarView {
                 add_top_bar = &adw::HeaderBar {
                     // The back button is added by the NavigationView automatically.
+                    // Single-click primary action (cancel / re-run), labelled. It
+                    // reuses the shared "runs" actions (resolved on the root
+                    // window). `#[watch]` keeps it in step as the run transitions
+                    // (e.g. cancel → re-run) while the page is open.
+                    pack_end = &gtk::Button {
+                        #[watch]
+                        set_tooltip_text: Some(run_action_spec(model.run.status).label),
+                        // `set_action_name` clears the target, so re-apply it after.
+                        #[watch]
+                        set_action_name: Some(run_action_spec(model.run.status).action),
+                        #[watch]
+                        set_action_target_value: Some(&model.run.id.to_variant()),
+                        // After the action binding, so it wins: disable while cancelling.
+                        #[watch]
+                        set_sensitive: run_action_spec(model.run.status).enabled,
+                        #[wrap(Some)]
+                        set_child = &adw::ButtonContent {
+                            #[watch]
+                            set_icon_name: run_action_spec(model.run.status).icon,
+                            #[watch]
+                            set_label: run_action_spec(model.run.status).label,
+                        },
+                    },
+                    // Re-run only the failed jobs — shown when the run failed.
+                    pack_end = &gtk::Button {
+                        #[watch]
+                        set_visible: model.run.conclusion.is_some_and(Conclusion::is_failure),
+                        set_tooltip_text: Some("Re-run only the failed jobs"),
+                        set_action_name: Some("runs.rerun-failed"),
+                        set_action_target_value: Some(&model.run.id.to_variant()),
+                        #[wrap(Some)]
+                        set_child = &adw::ButtonContent {
+                            set_icon_name: "view-refresh-symbolic",
+                            set_label: "Re-run failed",
+                        },
+                    },
                     pack_end = &gtk::Button {
                         set_icon_name: "web-browser-symbolic",
                         set_tooltip_text: Some("Open in browser"),
@@ -201,12 +285,14 @@ impl Component for RunDetail {
                                     set_title: "Status",
                                     #[template]
                                     add_suffix = &StatusChip {
+                                        #[watch]
                                         set_css_classes: &[
                                             "status-chip",
                                             status_chip::variant(model.run.status, model.run.conclusion),
                                         ],
                                         #[template_child]
                                         label {
+                                            #[watch]
                                             set_label: status_chip::label(model.run.status, model.run.conclusion),
                                         },
                                     },
@@ -284,28 +370,29 @@ impl Component for RunDetail {
     ) -> ComponentParts<Self> {
         let jobs_group = adw::PreferencesGroup::new();
 
-        // Capture what the fetch needs before the run moves into the model.
-        let repo = init.run.repo.clone();
-        let run_id = init.run.id;
-        let octocrab = init.octocrab;
-
         let model = RunDetail {
             run: init.run,
             state: JobsState::Loading,
+            octocrab: init.octocrab,
             jobs_group: jobs_group.clone(),
+            jobs: Vec::new(),
+            job_rows: Vec::new(),
         };
 
         let widgets = view_output!();
-
-        sender.oneshot_command(async move {
-            let outcome = match repo.split_once('/') {
-                Some((owner, name)) => client::list_jobs(&octocrab, owner, name, run_id).await,
-                None => Err(format!("“{repo}” isn't a valid owner/name")),
-            };
-            RunDetailCmd::JobsLoaded(Box::new(outcome))
-        });
-
+        model.fetch_jobs(&sender);
         ComponentParts { model, widgets }
+    }
+
+    fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>, _root: &Self::Root) {
+        match msg {
+            // Latest run data drives the `#[watch]` metadata (status, elapsed, the
+            // action button); re-fetch the jobs to match.
+            RunDetailInput::Refresh(run) => {
+                self.run = *run;
+                self.fetch_jobs(&sender);
+            }
+        }
     }
 
     fn update_cmd(
@@ -317,11 +404,20 @@ impl Component for RunDetail {
         match msg {
             RunDetailCmd::JobsLoaded(result) => match *result {
                 Ok(jobs) => {
-                    self.populate_jobs(&jobs, &sender);
+                    // Rebuild only on a real change, so an unchanged poll doesn't
+                    // flicker the list or collapse an expanded job.
+                    if jobs != self.jobs {
+                        self.populate_jobs(&jobs, &sender);
+                        self.jobs = jobs;
+                    }
                     self.state = JobsState::Loaded;
                 }
+                // A failed *refresh* keeps what we have; only a failed first load
+                // (nothing shown yet) becomes the error state.
                 Err(message) => {
-                    self.state = JobsState::Error(message);
+                    if self.jobs.is_empty() {
+                        self.state = JobsState::Error(message);
+                    }
                 }
             },
         }
