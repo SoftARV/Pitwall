@@ -27,6 +27,7 @@ use relm4::{
 };
 
 use crate::components::repo_picker::{RepoPicker, RepoPickerInit, RepoPickerOutput};
+use crate::components::run_detail::{RunDetail, RunDetailInit, RunDetailOutput};
 use crate::components::run_row::{RunRow, RunRowInput, RunRowOutput};
 use crate::github::client::{self, ConnectError, Connection, RepoRuns, RunsOutcome};
 use crate::github::types::{Conclusion, RateLimit, WorkflowRun};
@@ -109,6 +110,12 @@ pub struct AppModel {
     onboarding: Option<Onboarding>,
     /// The repo picker dialog, while it's open.
     repo_picker: Option<Controller<RepoPicker>>,
+    /// The navigation stack: the run list at the root, a detail page pushed on
+    /// top. Held so `update` can push; a refcounted GTK handle.
+    nav: adw::NavigationView,
+    /// The run detail page, while one is open. Holding the `Controller` keeps it
+    /// (and its jobs fetch) alive; dropping it on navigate-back shuts it down.
+    detail: Option<Controller<RunDetail>>,
     /// The watched repos as `owner/name`, mirrored from settings for the view.
     watched: Vec<String>,
     /// The visible run rows, reconciled in place from `all_runs` (rule 7).
@@ -162,7 +169,11 @@ pub enum AppMsg {
     Refresh,
     /// A user-triggered refresh (menu / Ctrl+R): reload, and spin the header.
     ManualRefresh,
-    /// Open a run on github.com (a row was activated).
+    /// Open a run's native detail page (a row was activated).
+    ShowDetails(u64),
+    /// The detail page was popped (back / Escape) — drop its controller.
+    DetailClosed,
+    /// Open a run on github.com (the row's browser button).
     OpenInBrowser(String),
     /// The window became visible / hidden — gates the poll (rule 3).
     SuspendedChanged(bool),
@@ -579,7 +590,12 @@ impl Component for AppModel {
 
             #[local_ref]
             toast_overlay -> adw::ToastOverlay {
-                adw::ToolbarView {
+                #[local_ref]
+                nav -> adw::NavigationView {
+                    adw::NavigationPage {
+                        set_title: "Pitwall",
+
+                        adw::ToolbarView {
                     add_top_bar = &adw::HeaderBar {
                         #[wrap(Some)]
                         set_title_widget = &adw::WindowTitle {
@@ -718,6 +734,8 @@ impl Component for AppModel {
                         set_visible_child_name: model.state_page(),
                     },
                 },
+                    },
+                },
             },
         }
     }
@@ -758,6 +776,7 @@ impl Component for AppModel {
         let runs = FactoryVecDeque::builder()
             .launch(adw::PreferencesGroup::default())
             .forward(sender.input_sender(), |output| match output {
+                RunRowOutput::ShowDetails(id) => AppMsg::ShowDetails(id),
                 RunRowOutput::OpenInBrowser(url) => AppMsg::OpenInBrowser(url),
             });
 
@@ -770,6 +789,8 @@ impl Component for AppModel {
             toast_overlay: adw::ToastOverlay::new(),
             onboarding: None,
             repo_picker: None,
+            nav: adw::NavigationView::new(),
+            detail: None,
             runs,
             all_runs: Vec::new(),
             runs_by_repo: HashMap::new(),
@@ -785,6 +806,7 @@ impl Component for AppModel {
         };
 
         let toast_overlay = model.toast_overlay.clone();
+        let nav = model.nav.clone();
         let runs_group = model.runs.widget();
 
         let widgets = view_output!();
@@ -819,6 +841,13 @@ impl Component for AppModel {
         let watchlist_sender = sender.input_sender().clone();
         widgets.watchlist_button.connect_clicked(move |_| {
             watchlist_sender.send(AppMsg::EditWatchlist).ok();
+        });
+
+        // A pop means the user left the detail page (the only thing we push), so
+        // let the reducer drop its controller.
+        let popped = sender.input_sender().clone();
+        nav.connect_popped(move |_, _| {
+            popped.send(AppMsg::DetailClosed).ok();
         });
 
         // Menu actions — thin bridges to `AppMsg` (Quit acts directly).
@@ -1010,6 +1039,29 @@ impl Component for AppModel {
             }
 
             AppMsg::OpenInBrowser(url) => Self::open_uri(&url, root),
+
+            AppMsg::ShowDetails(id) => {
+                let Some(connection) = &self.connection else {
+                    return;
+                };
+                let Some(run) = self.all_runs.iter().find(|run| run.id == id) else {
+                    return;
+                };
+                let controller = RunDetail::builder()
+                    .launch(RunDetailInit {
+                        octocrab: connection.octocrab.clone(),
+                        run: run.clone(),
+                    })
+                    .forward(sender.input_sender(), |output| match output {
+                        RunDetailOutput::OpenInBrowser(url) => AppMsg::OpenInBrowser(url),
+                    });
+                self.nav.push(controller.widget());
+                self.detail = Some(controller);
+            }
+
+            AppMsg::DetailClosed => {
+                self.detail = None;
+            }
 
             AppMsg::SuspendedChanged(suspended) => {
                 if suspended {

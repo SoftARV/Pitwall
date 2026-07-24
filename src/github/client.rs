@@ -15,7 +15,7 @@ use http::{HeaderMap, HeaderValue};
 use octocrab::{FromResponse, Octocrab, Page};
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::github::types::{RateLimit, Repo, WorkflowRun};
+use crate::github::types::{Job, RateLimit, Repo, WorkflowRun};
 
 /// The OAuth App's **public** client id. Device flow needs no secret, and every
 /// device-flow client ships its id in the binary (gh's is public too), so
@@ -273,6 +273,24 @@ fn read_rate(headers: &HeaderMap) -> Option<RateLimit> {
         limit: number("x-ratelimit-limit")?,
         reset: number("x-ratelimit-reset").and_then(|ts| DateTime::from_timestamp(ts as i64, 0)),
     })
+}
+
+/// List the jobs of one run (each carries its steps), for the detail page. One
+/// request, on demand — not on the poll path.
+pub async fn list_jobs(
+    octocrab: &Octocrab,
+    owner: &str,
+    name: &str,
+    run_id: u64,
+) -> Result<Vec<Job>, String> {
+    let page = octocrab
+        .workflows(owner, name)
+        .list_jobs(octocrab::models::RunId(run_id))
+        .per_page(100u8)
+        .send()
+        .await
+        .map_err(|err| diagnose(err).message().to_owned())?;
+    Ok(page.items.into_iter().map(Job::from_model).collect())
 }
 
 /// Step 1 of the device flow: ask GitHub for a user code. The returned

@@ -6,5 +6,6 @@
 //! from `github::types` (CLAUDE.md rule 4).
 
 pub mod repo_picker;
+pub mod run_detail;
 pub mod run_row;
 pub mod status_chip;
