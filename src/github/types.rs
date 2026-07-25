@@ -177,7 +177,8 @@ impl Conclusion {
 }
 
 /// One workflow run, the unit the list shows. octocrab's `Run` stops here.
-#[derive(Debug, Clone)]
+/// `PartialEq` lets the repos view skip rebuilding a repo whose runs are unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowRun {
     /// GitHub's run id — the stable key the list reconciles on.
     pub id: u64,
@@ -237,6 +238,9 @@ pub struct Job {
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
     pub steps: Vec<Step>,
+    /// The job's **check-run** id (parsed from its `check_run_url`) — the key to
+    /// its annotations on the Checks API. `None` if the URL didn't parse.
+    pub check_run_id: Option<u64>,
 }
 
 impl Job {
@@ -249,6 +253,74 @@ impl Job {
             started_at: Some(job.started_at),
             completed_at: job.completed_at,
             steps: job.steps.into_iter().map(Step::from_model).collect(),
+            check_run_id: parse_trailing_id(&job.check_run_url),
+        }
+    }
+}
+
+/// The trailing numeric id of a `.../check-runs/{id}` URL, if present.
+fn parse_trailing_id(url: &str) -> Option<u64> {
+    url.rsplit('/').next()?.parse().ok()
+}
+
+/// How serious an annotation is — GitHub's `annotation_level`, narrowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnotationLevel {
+    Failure,
+    Warning,
+    Notice,
+}
+
+impl AnnotationLevel {
+    /// Unknown levels read as warnings — the safe middle.
+    pub fn from_api(level: Option<&str>) -> Self {
+        match level {
+            Some("failure") => AnnotationLevel::Failure,
+            Some("notice") => AnnotationLevel::Notice,
+            _ => AnnotationLevel::Warning,
+        }
+    }
+
+    /// Sort key: failures first, then warnings, then notices.
+    pub fn order(self) -> u8 {
+        match self {
+            AnnotationLevel::Failure => 0,
+            AnnotationLevel::Warning => 1,
+            AnnotationLevel::Notice => 2,
+        }
+    }
+}
+
+/// A single annotation on a run — a warning / error / notice GitHub surfaces in
+/// its "Annotations" section, with an optional file location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Annotation {
+    pub level: AnnotationLevel,
+    pub title: Option<String>,
+    pub message: String,
+    /// `path:line`, or empty when the annotation isn't file-bound.
+    pub location: String,
+    /// The job it came from, for context.
+    pub job: String,
+}
+
+impl Annotation {
+    /// The line shown as the row's title: the message, or the title as a fallback.
+    pub fn headline(&self) -> &str {
+        if !self.message.is_empty() {
+            &self.message
+        } else {
+            self.title.as_deref().unwrap_or("(no message)")
+        }
+    }
+
+    /// "src/foo.rs:12 · build" — location and job, whichever are present.
+    pub fn context(&self) -> String {
+        match (self.location.is_empty(), self.job.is_empty()) {
+            (false, false) => format!("{} · {}", self.location, self.job),
+            (true, false) => self.job.clone(),
+            (false, true) => self.location.clone(),
+            (true, true) => String::new(),
         }
     }
 }

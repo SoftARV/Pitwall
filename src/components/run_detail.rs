@@ -18,6 +18,7 @@ use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use relm4::adw::prelude::*;
+use relm4::gtk::glib;
 use relm4::{Component, ComponentParts, ComponentSender, RelmWidgetExt, adw, gtk};
 
 use octocrab::Octocrab;
@@ -25,7 +26,9 @@ use octocrab::Octocrab;
 use crate::components::run_row::run_action_spec;
 use crate::components::status_chip::{self, StatusChip};
 use crate::github::client;
-use crate::github::types::{Conclusion, Job, RunStatus, Step, WorkflowRun};
+use crate::github::types::{
+    Annotation, AnnotationLevel, Conclusion, Job, RunStatus, Step, WorkflowRun,
+};
 
 pub struct RunDetailInit {
     pub octocrab: Octocrab,
@@ -46,6 +49,11 @@ pub struct RunDetail {
     /// The built job rows (by job name), for clearing on rebuild and for
     /// preserving which were expanded across it.
     job_rows: Vec<(String, adw::ExpanderRow)>,
+    /// The "Annotations" group (warnings / errors / notices), hidden until there
+    /// are any. Filled from the jobs' check runs when the jobs change.
+    annotations_group: adw::PreferencesGroup,
+    /// The built annotation rows, for clearing on refresh.
+    annotation_rows: Vec<adw::ActionRow>,
 }
 
 #[derive(Debug)]
@@ -82,6 +90,8 @@ pub enum RunDetailOutput {
 #[derive(Debug)]
 pub enum RunDetailCmd {
     JobsLoaded(Box<Result<Vec<Job>, String>>),
+    /// A run's annotations, fetched after the jobs settle.
+    AnnotationsLoaded(Vec<Annotation>),
 }
 
 impl RunDetail {
@@ -140,6 +150,45 @@ impl RunDetail {
             };
             RunDetailCmd::JobsLoaded(Box::new(outcome))
         });
+    }
+
+    /// Fetch the run's annotations off-thread from the (current) jobs' check runs;
+    /// the result lands as `AnnotationsLoaded`. Called only when the jobs change,
+    /// so it doesn't re-run on every poll.
+    fn fetch_annotations(&self, sender: &ComponentSender<Self>) {
+        let octocrab = self.octocrab.clone();
+        let repo = self.run.repo.clone();
+        let jobs = self.jobs.clone();
+        sender.oneshot_command(async move {
+            let annotations = match repo.split_once('/') {
+                Some((owner, name)) => {
+                    client::fetch_annotations(&octocrab, owner, name, &jobs).await
+                }
+                None => Vec::new(),
+            };
+            RunDetailCmd::AnnotationsLoaded(annotations)
+        });
+    }
+
+    /// Fill the annotations group, hiding it when there are none. Rebuilt whole
+    /// each time (annotations are few and flat — no expansion to preserve).
+    fn populate_annotations(&mut self, annotations: &[Annotation]) {
+        for row in self.annotation_rows.drain(..) {
+            self.annotations_group.remove(&row);
+        }
+        for annotation in annotations {
+            let row = adw::ActionRow::new();
+            row.set_title(&glib::markup_escape_text(annotation.headline()));
+            row.set_title_lines(2);
+            let context = annotation.context();
+            if !context.is_empty() {
+                row.set_subtitle(&glib::markup_escape_text(&context));
+            }
+            row.add_prefix(&annotation_icon(annotation.level));
+            self.annotations_group.add(&row);
+            self.annotation_rows.push(row);
+        }
+        self.annotations_group.set_visible(!annotations.is_empty());
     }
 
     /// Rebuild the jobs group: one expandable row per job, each expanding to its
@@ -325,6 +374,14 @@ impl Component for RunDetail {
                                 },
                             },
 
+                            // Warnings / errors / notices from the run's check
+                            // runs. Filled (and shown) by `populate_annotations`.
+                            #[local_ref]
+                            annotations_group -> adw::PreferencesGroup {
+                                set_title: "Annotations",
+                                set_visible: false,
+                            },
+
                             gtk::Stack {
                                 add_named[Some("loading")] = &gtk::Box {
                                     set_orientation: gtk::Orientation::Vertical,
@@ -369,6 +426,7 @@ impl Component for RunDetail {
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
         let jobs_group = adw::PreferencesGroup::new();
+        let annotations_group = adw::PreferencesGroup::new();
 
         let model = RunDetail {
             run: init.run,
@@ -377,6 +435,8 @@ impl Component for RunDetail {
             jobs_group: jobs_group.clone(),
             jobs: Vec::new(),
             job_rows: Vec::new(),
+            annotations_group: annotations_group.clone(),
+            annotation_rows: Vec::new(),
         };
 
         let widgets = view_output!();
@@ -409,6 +469,8 @@ impl Component for RunDetail {
                     if jobs != self.jobs {
                         self.populate_jobs(&jobs, &sender);
                         self.jobs = jobs;
+                        // Annotations follow the jobs — fetch only when they move.
+                        self.fetch_annotations(&sender);
                     }
                     self.state = JobsState::Loaded;
                 }
@@ -420,8 +482,23 @@ impl Component for RunDetail {
                     }
                 }
             },
+            RunDetailCmd::AnnotationsLoaded(annotations) => {
+                self.populate_annotations(&annotations);
+            }
         }
     }
+}
+
+/// A coloured level icon for an annotation row.
+fn annotation_icon(level: AnnotationLevel) -> gtk::Image {
+    let (icon, css) = match level {
+        AnnotationLevel::Failure => ("dialog-error-symbolic", "error"),
+        AnnotationLevel::Warning => ("dialog-warning-symbolic", "warning"),
+        AnnotationLevel::Notice => ("dialog-information-symbolic", "accent"),
+    };
+    let image = gtk::Image::from_icon_name(icon);
+    image.add_css_class(css);
+    image
 }
 
 /// "45s" / "1m 23s" between two instants (clamped at zero).

@@ -15,7 +15,9 @@ use http::{HeaderMap, HeaderValue};
 use octocrab::{FromResponse, Octocrab, Page};
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::github::types::{Job, RateLimit, Repo, WorkflowRun};
+use crate::github::types::{
+    Annotation, AnnotationLevel, Job, RateLimit, Repo, RunStatus, WorkflowRun,
+};
 
 /// The OAuth App's **public** client id. Device flow needs no secret, and every
 /// device-flow client ships its id in the binary (gh's is public too), so
@@ -328,6 +330,63 @@ pub async fn fetch_job_log(
         .body_to_string(response)
         .await
         .map_err(|err| diagnose(err).message().to_owned())
+}
+
+/// Gather a run's annotations (errors / warnings / notices) from its jobs' check
+/// runs — the same set GitHub shows in a run's "Annotations" section. Each job
+/// carries a check-run id; we list that check run's annotations via the Checks
+/// API and map them into our own type (rule 4). Only **completed** jobs are
+/// queried (in-progress ones don't have annotations yet, and it keeps the call
+/// count down); a per-job failure is logged and skipped, not fatal. Failures
+/// sort first.
+pub async fn fetch_annotations(
+    octocrab: &Octocrab,
+    owner: &str,
+    repo: &str,
+    jobs: &[Job],
+) -> Vec<Annotation> {
+    let mut out = Vec::new();
+    for job in jobs {
+        if job.status != RunStatus::Completed {
+            continue;
+        }
+        let Some(check_run_id) = job.check_run_id else {
+            continue;
+        };
+        match octocrab
+            .checks(owner, repo)
+            .list_annotations(check_run_id.into())
+            .send()
+            .await
+        {
+            Ok(annotations) => {
+                for annotation in annotations {
+                    out.push(Annotation {
+                        level: AnnotationLevel::from_api(annotation.annotation_level.as_deref()),
+                        title: annotation.title.filter(|title| !title.is_empty()),
+                        message: annotation.message.unwrap_or_default(),
+                        location: annotation_location(&annotation.path, annotation.start_line),
+                        job: job.name.clone(),
+                    });
+                }
+            }
+            Err(err) => {
+                tracing::debug!(job = %job.name, "annotations fetch failed: {}", diagnose(err).message());
+            }
+        }
+    }
+    out.sort_by_key(|annotation| annotation.level.order());
+    out
+}
+
+/// `path:line` for a file-bound annotation; empty for run-level ones (GitHub uses
+/// `.github` as the path for those).
+fn annotation_location(path: &str, line: u32) -> String {
+    if path.is_empty() || path == ".github" {
+        String::new()
+    } else {
+        format!("{path}:{line}")
+    }
 }
 
 /// Re-run **all** of a run's jobs. octocrab 0.54 has no helper for this endpoint
