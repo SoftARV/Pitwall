@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="data/icons/hicolor/256x256/apps/dev.miguelrincon.Pitwall.png" alt="Pitwall icon" width="128" height="128">
+</p>
+
 <h1 align="center">Pitwall</h1>
 
 <p align="center">
