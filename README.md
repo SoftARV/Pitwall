@@ -31,6 +31,15 @@ with [octocrab](https://docs.rs/octocrab/) for the GitHub API and
 > Pitwall is a personal, single-machine **monitor** — not a full GitHub client,
 > not multi-user, not cross-platform. One user, one Linux laptop.
 
+## Screenshots
+
+<p align="center">
+  <img src="data/screenshots/list.png" alt="The run list, with the Recent and Repositories tabs and colour-coded status chips" width="49%">
+  <img src="data/screenshots/detail.png" alt="A run's detail page showing its metadata, an Annotations section, and jobs" width="49%">
+</p>
+
+<p align="center"><sub>The run list (Recent / Repositories) · a run's detail with annotations</sub></p>
+
 ## Features
 
 - **Recent & Repositories views** — a **Recent** tab with the newest runs across
