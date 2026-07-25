@@ -78,7 +78,7 @@ with [octocrab](https://docs.rs/octocrab/) for the GitHub API and
 - A running **keyring** provider (gnome-keyring is the default on GNOME)
 - A **GitHub account** — no token to create or paste; you sign in from the app
 
-On Arch / CachyOS:
+On Arch:
 
 ```bash
 sudo pacman -S --needed base-devel pkgconf rust gtk4 libadwaita librsvg
@@ -110,33 +110,6 @@ cargo build --release           # optimised binary at target/release/pitwall
 
 make check                      # the bar: fmt --check, clippy -D warnings, test
 ```
-
-## First run
-
-On first launch a blocking onboarding dialog introduces the app and offers
-**Sign in with GitHub**. Pitwall uses GitHub's OAuth **device flow**: it shows an
-8-character code, opens `github.com/login/device` in your browser (copying the
-code for you), and connects once you authorise. The `repo` scope is requested —
-the narrowest that reads Actions on your private and public repos and later
-re-runs / cancels them. Then pick the repositories to watch, and you're set.
-
-## Configuration
-
-- **Preferences** (Ctrl+, or the primary menu): theme, poll interval, and when to
-  notify. Persisted to `~/.config/pitwall/settings.ini` (also holds your watched
-  repo list and theme — **never** the token).
-- **Token**: the GitHub OAuth token lives in the GNOME keyring, keyed by the app
-  id. Sign out from the menu to clear it.
-
-## Keyboard shortcuts
-
-| Shortcut        | Action              |
-| --------------- | ------------------- |
-| `Ctrl`+`R` / `F5` | Refresh           |
-| `Ctrl`+`F`      | Search              |
-| `Ctrl`+`,`      | Preferences         |
-| `Ctrl`+`?`      | Keyboard shortcuts  |
-| `Ctrl`+`Q`      | Quit                |
 
 ## How it works
 
