@@ -52,6 +52,7 @@ const RECENT_CAP: usize = 25;
 relm4::new_stateless_action!(EditWatchlistAction, AppMenuActionGroup, "edit-watchlist");
 relm4::new_stateless_action!(SignOutAction, AppMenuActionGroup, "sign-out");
 relm4::new_stateless_action!(PreferencesAction, AppMenuActionGroup, "preferences");
+relm4::new_stateless_action!(ShortcutsAction, AppMenuActionGroup, "shortcuts");
 relm4::new_stateless_action!(AboutAction, AppMenuActionGroup, "about");
 relm4::new_stateless_action!(QuitAction, AppMenuActionGroup, "quit");
 
@@ -277,6 +278,8 @@ pub enum AppMsg {
     SuspendedChanged(bool),
     /// Open the Preferences dialog (primary menu / Ctrl+,).
     ShowPreferences,
+    /// Open the Keyboard Shortcuts dialog (primary menu / Ctrl+?).
+    ShowShortcuts,
     /// The notifications preference changed (from Preferences).
     SetNotifyOn(NotifyOn),
     /// The theme changed (from Preferences) — applied immediately.
@@ -1481,6 +1484,7 @@ impl Component for AppModel {
         menu.append_section(None, &account);
         let app_section = gio::Menu::new();
         app_section.append(Some("Preferences"), Some("win.preferences"));
+        app_section.append(Some("Keyboard Shortcuts"), Some("win.shortcuts"));
         app_section.append(Some("About Pitwall"), Some("win.about"));
         app_section.append(Some("Quit"), Some("win.quit"));
         menu.append_section(None, &app_section);
@@ -1517,6 +1521,10 @@ impl Component for AppModel {
             RelmAction::new_stateless(move |_| {
                 prefs_sender.send(AppMsg::ShowPreferences).ok();
             });
+        let shortcuts_sender = sender.input_sender().clone();
+        let shortcuts_action: RelmAction<ShortcutsAction> = RelmAction::new_stateless(move |_| {
+            shortcuts_sender.send(AppMsg::ShowShortcuts).ok();
+        });
         let about_sender = sender.input_sender().clone();
         let about_action: RelmAction<AboutAction> = RelmAction::new_stateless(move |_| {
             about_sender.send(AppMsg::ShowAbout).ok();
@@ -1531,6 +1539,7 @@ impl Component for AppModel {
         group.add_action(refresh_action);
         group.add_action(search_action);
         group.add_action(preferences_action);
+        group.add_action(shortcuts_action);
         group.add_action(about_action);
         group.add_action(quit_action);
         group.register_for_widget(&root);
@@ -1540,6 +1549,7 @@ impl Component for AppModel {
         app.set_accelerators_for_action::<RefreshAction>(&["<primary>r", "F5"]);
         app.set_accelerators_for_action::<SearchAction>(&["<primary>f"]);
         app.set_accelerators_for_action::<PreferencesAction>(&["<primary>comma"]);
+        app.set_accelerators_for_action::<ShortcutsAction>(&["<primary>question"]);
 
         // A notification click opens the run on github.com. This is an *app*-scoped
         // action (`app.open-run`), not a `win.` one: GNOME activates a
@@ -1849,6 +1859,22 @@ impl Component for AppModel {
 
             AppMsg::ShowPreferences => {
                 self.present_preferences(&sender, root);
+            }
+
+            AppMsg::ShowShortcuts => {
+                let dialog = adw::ShortcutsDialog::new();
+                let section = adw::ShortcutsSection::new(Some("General"));
+                for (title, accel) in [
+                    ("Refresh", "<primary>r F5"),
+                    ("Search", "<primary>f"),
+                    ("Preferences", "<primary>comma"),
+                    ("Keyboard Shortcuts", "<primary>question"),
+                    ("Quit", "<primary>q"),
+                ] {
+                    section.add(adw::ShortcutsItem::new(title, accel));
+                }
+                dialog.add(section);
+                dialog.present(Some(root));
             }
 
             AppMsg::SetNotifyOn(on) => {
