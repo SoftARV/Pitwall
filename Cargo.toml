@@ -1,6 +1,6 @@
 [package]
 name = "pitwall"
-version = "0.1.0-dev"
+version = "0.1.0"
 edition = "2024"
 description = "A native GNOME app to monitor your GitHub Actions runs from the desktop"
 license = "GPL-3.0-or-later"
