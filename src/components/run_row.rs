@@ -96,8 +96,9 @@ pub(crate) fn run_action_spec(status: RunStatus) -> RunActionSpec {
 
 /// A compact "5m ago" for the run's start time. Recomputed on each `Update`, so
 /// it stays roughly current as the poll refreshes rows. A clock skew that puts
-/// the run in the future reads as "just now" rather than a negative age.
-fn relative(when: DateTime<Utc>) -> String {
+/// the run in the future reads as "just now" rather than a negative age. Shared
+/// with the repos view.
+pub(crate) fn relative(when: DateTime<Utc>) -> String {
     let seconds = Utc::now().signed_duration_since(when).num_seconds();
     match seconds {
         s if s < 45 => "just now".to_owned(),

@@ -177,7 +177,8 @@ impl Conclusion {
 }
 
 /// One workflow run, the unit the list shows. octocrab's `Run` stops here.
-#[derive(Debug, Clone)]
+/// `PartialEq` lets the repos view skip rebuilding a repo whose runs are unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowRun {
     /// GitHub's run id — the stable key the list reconciles on.
     pub id: u64,

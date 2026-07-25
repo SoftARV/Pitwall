@@ -30,7 +30,8 @@ use relm4::{
 use crate::components::log_view::{LogView, LogViewInit, LogViewOutput};
 use crate::components::repo_picker::{RepoPicker, RepoPickerInit, RepoPickerOutput};
 use crate::components::run_detail::{RunDetail, RunDetailInit, RunDetailInput, RunDetailOutput};
-use crate::components::run_row::{RunRow, RunRowInput, RunRowOutput};
+use crate::components::run_row::{RunRow, RunRowInput, RunRowOutput, relative, run_action_spec};
+use crate::components::status_chip;
 use crate::github::client::{self, ConnectError, Connection, RepoRuns, RunsOutcome};
 use crate::github::types::{Conclusion, RateLimit, RunStatus, WorkflowRun};
 use crate::notify;
@@ -44,6 +45,10 @@ use crate::settings::{MAX_POLL_INTERVAL, MIN_POLL_INTERVAL, NotifyOn, Settings, 
 relm4::new_action_group!(AppMenuActionGroup, "win");
 relm4::new_stateless_action!(RefreshAction, AppMenuActionGroup, "refresh");
 relm4::new_stateless_action!(SearchAction, AppMenuActionGroup, "search");
+
+/// How many runs the Recent tab shows — newest-first, "doesn't have to be long".
+/// The Repositories tab is where the full per-repo history lives.
+const RECENT_CAP: usize = 25;
 relm4::new_stateless_action!(EditWatchlistAction, AppMenuActionGroup, "edit-watchlist");
 relm4::new_stateless_action!(SignOutAction, AppMenuActionGroup, "sign-out");
 relm4::new_stateless_action!(PreferencesAction, AppMenuActionGroup, "preferences");
@@ -199,6 +204,20 @@ pub struct AppModel {
     /// The current search text; filters the visible list by repo / workflow /
     /// branch, client-side. Empty means "show everything".
     query: String,
+    /// The Recent / Repositories tab stack, held so search can force it to the
+    /// recent (results) view and so the Recent tab's failing badge can be set.
+    view_stack: adw::ViewStack,
+    /// The Recent tab's page, for its failing-count badge.
+    recent_page: adw::ViewStackPage,
+    /// The Repositories tab's list — one expander per watched repo, built
+    /// imperatively (like the detail page's jobs) and reconciled on each poll.
+    repos_group: adw::PreferencesGroup,
+    /// The built repo rows (by full name), for clearing on rebuild and for
+    /// preserving which were expanded across it.
+    repo_rows: Vec<(String, adw::ExpanderRow)>,
+    /// The per-repo runs the Repositories tab currently shows — rebuilt only
+    /// when this changes, so an unchanged poll neither flickers nor collapses.
+    repos_shown: Vec<(String, Vec<WorkflowRun>)>,
     /// The "Sign Out", "Edit Watchlist", and "Refresh" menu actions — all
     /// `hidden-when="action-disabled"`, so they show (and act) only when signed
     /// in; disabling *hides* them rather than greying them.
@@ -316,34 +335,22 @@ impl AppModel {
         self.toast_overlay.add_toast(adw::Toast::new(message));
     }
 
-    /// The header subtitle: a live run summary once runs have loaded, else who
-    /// we're signed in as. Empty when disconnected, so the subtitle line hides.
-    fn header_subtitle(&self) -> String {
-        if matches!(self.state, ViewState::Ready) && self.runs_loaded && !self.all_runs.is_empty() {
-            let total = self.all_runs.len();
-            let failing = self
-                .all_runs
-                .iter()
-                .filter(|run| run.conclusion.is_some_and(Conclusion::is_failure))
-                .count();
-            let running = self
-                .all_runs
-                .iter()
-                .filter(|run| run.status.is_active())
-                .count();
-            let mut parts = vec![format!("{total} run{}", if total == 1 { "" } else { "s" })];
-            if failing > 0 {
-                parts.push(format!("{failing} failing"));
-            }
-            if running > 0 {
-                parts.push(format!("{running} running"));
-            }
-            parts.join(" · ")
-        } else if let Some(connection) = &self.connection {
-            format!("Signed in as {}", connection.login)
-        } else {
-            String::new()
-        }
+    /// The window title's subtitle, shown only when the tab switcher isn't (the
+    /// run counts moved to the Recent tab's badge). Who we're signed in as, or
+    /// empty when disconnected so the subtitle line hides.
+    fn title_subtitle(&self) -> String {
+        self.connection
+            .as_ref()
+            .map(|connection| format!("Signed in as {}", connection.login))
+            .unwrap_or_default()
+    }
+
+    /// The count of failing runs — the Recent tab's badge (0 hides it).
+    fn failing_count(&self) -> u32 {
+        self.all_runs
+            .iter()
+            .filter(|run| run.conclusion.is_some_and(Conclusion::is_failure))
+            .count() as u32
     }
 
     /// Enable (or disable) the signed-in-only menu actions together. Disabled
@@ -364,10 +371,10 @@ impl AppModel {
             "loading"
         } else if self.all_runs.is_empty() {
             "no-runs"
-        } else if self.runs.is_empty() {
+        } else if self.searching() && self.runs.is_empty() {
             "no-results"
         } else {
-            "runs"
+            "main"
         }
     }
 
@@ -375,6 +382,17 @@ impl AppModel {
     /// runs to actually filter.
     fn searchable(&self) -> bool {
         matches!(self.state, ViewState::Ready) && self.runs_loaded && !self.all_runs.is_empty()
+    }
+
+    /// Whether a search is in progress (the dedicated results screen is shown).
+    fn searching(&self) -> bool {
+        !self.query.trim().is_empty()
+    }
+
+    /// Whether to show the Recent/Repositories tab switcher — connected with runs,
+    /// and not mid-search (search takes over the whole surface).
+    fn showing_tabs(&self) -> bool {
+        self.searchable() && !self.searching()
     }
 
     /// The runs matching the current search, newest-first order preserved. A
@@ -394,6 +412,17 @@ impl AppModel {
             })
             .cloned()
             .collect()
+    }
+
+    /// What the shared flat list shows: while searching, the full filtered set
+    /// (the dedicated results screen); otherwise the newest `RECENT_CAP` runs (the
+    /// Recent tab). `all_runs` is already newest-first, so `take` is the top N.
+    fn recent_or_search_runs(&self) -> Vec<WorkflowRun> {
+        if self.searching() {
+            self.filtered_runs()
+        } else {
+            self.all_runs.iter().take(RECENT_CAP).cloned().collect()
+        }
     }
 
     /// Start the poll, unless it's already running or there's nothing to poll.
@@ -658,7 +687,7 @@ impl AppModel {
     /// untouched), and when it *does* change, the 200 we get already carries the
     /// new queued/running state — never the old "completed" one. Mutates the
     /// per-repo cache (the source `all_runs` is rebuilt from), not just `all_runs`.
-    fn mark_rerunning(&mut self, id: u64) {
+    fn mark_rerunning(&mut self, id: u64, sender: &ComponentSender<Self>) {
         for runs in self.runs_by_repo.values_mut() {
             if let Some(run) = runs.iter_mut().find(|run| run.id == id) {
                 run.status = RunStatus::Queued;
@@ -667,17 +696,23 @@ impl AppModel {
             }
         }
         self.rebuild_runs();
-        self.apply_runs();
-        self.refresh_detail();
+        self.apply_all(sender);
     }
 
     /// Optimistically reflect a cancel: mark the run `Cancelling` at once (the
     /// overlay in `rebuild_runs` applies it), so the chip changes immediately
     /// rather than reading "Running" for the many seconds GitHub takes to stop it.
-    fn mark_cancelling(&mut self, id: u64) {
+    fn mark_cancelling(&mut self, id: u64, sender: &ComponentSender<Self>) {
         self.cancelling.insert(id);
         self.rebuild_runs();
+        self.apply_all(sender);
+    }
+
+    /// Push the current state into every run view: the flat list (Recent /
+    /// search), the Repositories tab, and any open detail page.
+    fn apply_all(&mut self, sender: &ComponentSender<Self>) {
         self.apply_runs();
+        self.apply_repos(sender);
         self.refresh_detail();
     }
 
@@ -757,11 +792,12 @@ impl AppModel {
         });
     }
 
-    /// Reconcile the visible rows from `all_runs`: update in place while the id
-    /// set is unchanged, rebuild only when membership changes (rule 7). The clone
-    /// avoids a simultaneous borrow of `self.all_runs` and `self.runs`.
+    /// Reconcile the flat list (Recent tab, or the search results) from the
+    /// current source: update in place while the id set is unchanged, rebuild only
+    /// when membership changes (rule 7). Also refreshes the Recent tab's failing
+    /// badge and, while searching, forces the surface to the results view.
     fn apply_runs(&mut self) {
-        let target = self.filtered_runs();
+        let target = self.recent_or_search_runs();
         let unchanged = self.runs.len() == target.len()
             && self
                 .runs
@@ -780,6 +816,70 @@ impl AppModel {
                 guard.push_back(run);
             }
         }
+
+        self.recent_page.set_badge_number(self.failing_count());
+        // Search takes over the whole surface: pin it to the flat list (the tab
+        // switcher is hidden while searching, so this is what's visible).
+        if self.searching() {
+            self.view_stack.set_visible_child_name("recent");
+        }
+    }
+
+    /// Rebuild the Repositories tab: one expander per watched repo, its latest run
+    /// shown collapsed and all of them when expanded. Rebuilt only when the data
+    /// changed — so an unchanged poll neither flickers nor collapses an expander —
+    /// and the expanded repos are restored across a rebuild (same as the detail
+    /// page's jobs).
+    fn apply_repos(&mut self, sender: &ComponentSender<Self>) {
+        let data: Vec<(String, Vec<WorkflowRun>)> = self
+            .watched
+            .iter()
+            .map(|repo| {
+                let mut runs = self.runs_by_repo.get(repo).cloned().unwrap_or_default();
+                runs.sort_by_key(|run| std::cmp::Reverse(run.created_at));
+                // Same "Cancelling" overlay the Recent list gets, so the two views
+                // agree while GitHub stops a run.
+                for run in &mut runs {
+                    if self.cancelling.contains(&run.id) && run.status != RunStatus::Completed {
+                        run.status = RunStatus::Cancelling;
+                    }
+                }
+                (repo.clone(), runs)
+            })
+            .collect();
+
+        if data == self.repos_shown {
+            return;
+        }
+
+        let expanded: HashSet<String> = self
+            .repo_rows
+            .iter()
+            .filter(|(_, row)| row.is_expanded())
+            .map(|(name, _)| name.clone())
+            .collect();
+        for (_, row) in self.repo_rows.drain(..) {
+            self.repos_group.remove(&row);
+        }
+
+        for (repo, runs) in &data {
+            let row = adw::ExpanderRow::new();
+            row.set_title(repo);
+            row.set_expanded(expanded.contains(repo));
+            match runs.first() {
+                Some(latest) => {
+                    row.set_subtitle(&repo_subtitle(latest));
+                    row.add_suffix(&status_chip::build(latest.status, latest.conclusion));
+                }
+                None => row.set_subtitle("No runs yet"),
+            }
+            for run in runs {
+                row.add_row(&repo_run_row(run, sender));
+            }
+            self.repos_group.add(&row);
+            self.repo_rows.push((repo.clone(), row));
+        }
+        self.repos_shown = data;
     }
 
     /// The disconnected page's description — the reason we couldn't connect.
@@ -979,6 +1079,68 @@ impl AppModel {
     }
 }
 
+/// A repo expander's subtitle — its latest run at a glance.
+fn repo_subtitle(run: &WorkflowRun) -> String {
+    format!(
+        "{} #{} · {} · {}",
+        run.workflow_name,
+        run.run_number,
+        run.head_branch,
+        relative(run.created_at),
+    )
+}
+
+/// One run inside a repo expander: a chip, a title/subtitle, click-to-open, and
+/// the shared re-run/cancel action button (same "runs" action group as the list).
+fn repo_run_row(run: &WorkflowRun, sender: &ComponentSender<AppModel>) -> adw::ActionRow {
+    let row = adw::ActionRow::new();
+    row.set_title(&format!("{} #{}", run.workflow_name, run.run_number));
+    row.set_subtitle(&format!(
+        "{} · {} · {}",
+        run.head_branch,
+        run.event,
+        relative(run.created_at),
+    ));
+    row.set_subtitle_lines(1);
+    row.add_prefix(&status_chip::build(run.status, run.conclusion));
+
+    row.set_activatable(true);
+    let input = sender.input_sender().clone();
+    let id = run.id;
+    row.connect_activated(move |_| {
+        input.send(AppMsg::ShowDetails(id)).ok();
+    });
+
+    let spec = run_action_spec(run.status);
+    let button = gtk::Button::from_icon_name(spec.icon);
+    button.set_valign(gtk::Align::Center);
+    button.add_css_class("flat");
+    button.set_tooltip_text(Some(spec.label));
+    button.set_action_name(Some(spec.action));
+    button.set_action_target_value(Some(&run.id.to_variant()));
+    button.set_sensitive(spec.enabled);
+    row.add_suffix(&button);
+    row
+}
+
+/// A run list wrapped in the app's standard clamp + scroller — the body of each
+/// tab page.
+fn clamped_scroll(child: &impl IsA<gtk::Widget>) -> gtk::ScrolledWindow {
+    let clamp = adw::Clamp::builder()
+        .maximum_size(700)
+        .tightening_threshold(500)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .child(child)
+        .build();
+    gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .child(&clamp)
+        .build()
+}
+
 #[relm4::component(pub)]
 impl Component for AppModel {
     type Init = Settings;
@@ -1000,11 +1162,22 @@ impl Component for AppModel {
 
                         adw::ToolbarView {
                     add_top_bar = &adw::HeaderBar {
+                        // The tab switcher takes the title spot once there are runs;
+                        // otherwise a plain title. The run counts live on the tab
+                        // badge now, not a subtitle.
                         #[wrap(Some)]
-                        set_title_widget = &adw::WindowTitle {
-                            set_title: "Pitwall",
+                        set_title_widget = &gtk::Stack {
+                            add_named[Some("title")] = &adw::WindowTitle {
+                                set_title: "Pitwall",
+                                #[watch]
+                                set_subtitle: &model.title_subtitle(),
+                            },
+                            add_named[Some("tabs")] = &adw::ViewSwitcher {
+                                set_stack: Some(&view_stack),
+                                set_policy: adw::ViewSwitcherPolicy::Wide,
+                            },
                             #[watch]
-                            set_subtitle: &model.header_subtitle(),
+                            set_visible_child_name: if model.showing_tabs() { "tabs" } else { "title" },
                         },
 
                         // Toggles the search bar; two-way bound to it in `init`.
@@ -1132,18 +1305,11 @@ impl Component for AppModel {
                                 ),
                             },
 
-                            add_named[Some("runs")] = &gtk::ScrolledWindow {
-                                set_vexpand: true,
-
-                                adw::Clamp {
-                                    set_maximum_size: 700,
-                                    set_tightening_threshold: 500,
-                                    set_margin_all: 12,
-
-                                    #[local_ref]
-                                    runs_group -> adw::PreferencesGroup {},
-                                },
-                            },
+                            // The Recent / Repositories tabs. The pages were added
+                            // imperatively in `init` (so we can hold them); here we
+                            // just place the stack. The header switcher drives it.
+                            #[local_ref]
+                            add_named[Some("main")] = &view_stack -> adw::ViewStack {},
 
                             #[watch]
                             set_visible_child_name: model.app_page(),
@@ -1217,6 +1383,25 @@ impl Component for AppModel {
                 RunRowOutput::OpenInBrowser(url) => AppMsg::OpenInBrowser(url),
             });
 
+        // Build the Recent / Repositories tab stack imperatively, so we can keep
+        // its pages (the Recent tab, for its badge) and force it to the results
+        // view while searching. The recent tab hosts the run-list factory; the
+        // repos tab hosts the group `apply_repos` fills.
+        let repos_group = adw::PreferencesGroup::new();
+        let view_stack = adw::ViewStack::new();
+        let recent_page = view_stack.add_titled_with_icon(
+            &clamped_scroll(runs.widget()),
+            Some("recent"),
+            "Recent",
+            "document-open-recent-symbolic",
+        );
+        view_stack.add_titled_with_icon(
+            &clamped_scroll(&repos_group),
+            Some("repos"),
+            "Repositories",
+            "view-grid-symbolic",
+        );
+
         let model = AppModel {
             connection: None,
             state: ViewState::Loading,
@@ -1242,6 +1427,11 @@ impl Component for AppModel {
             refreshing: false,
             poll: None,
             query: String::new(),
+            view_stack: view_stack.clone(),
+            recent_page,
+            repos_group,
+            repo_rows: Vec::new(),
+            repos_shown: Vec::new(),
             signout_action: signout_action.gio_action().clone(),
             editwatch_action: editwatch_action.gio_action().clone(),
             refresh_action: refresh_action.gio_action().clone(),
@@ -1250,7 +1440,6 @@ impl Component for AppModel {
 
         let toast_overlay = model.toast_overlay.clone();
         let nav = model.nav.clone();
-        let runs_group = model.runs.widget();
 
         let widgets = view_output!();
 
@@ -1845,8 +2034,7 @@ impl Component for AppModel {
                 // the first poll only seeds the baseline (no startup alert spam).
                 self.detect_and_notify(!self.runs_loaded);
                 self.runs_loaded = true;
-                self.apply_runs();
-                self.refresh_detail();
+                self.apply_all(&sender);
             }
 
             CommandMsg::ActionDone { id, action, result } => {
@@ -1857,8 +2045,10 @@ impl Component for AppModel {
                         // Show the knowable next state at once: re-run → queued,
                         // cancel → cancelling (held until GitHub finishes).
                         match action {
-                            RunAction::Rerun | RunAction::RerunFailed => self.mark_rerunning(id),
-                            RunAction::Cancel => self.mark_cancelling(id),
+                            RunAction::Rerun | RunAction::RerunFailed => {
+                                self.mark_rerunning(id, &sender)
+                            }
+                            RunAction::Cancel => self.mark_cancelling(id, &sender),
                         }
                         // Poll now, then a couple of quick follow-ups to catch the
                         // server catching up (the immediate one usually 304s).
