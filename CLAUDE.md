@@ -192,20 +192,24 @@ src/
                        #   (list runs, jobs, logs, re-run, cancel); ETag cache;
                        #   rate-limit awareness; error diagnosis that names the fix
     types.rs           # our WorkflowRun / Job / Step / Repo / RunStatus /
-                       #   Conclusion (+ tests). octocrab stops here.
+                       #   Conclusion / Annotation / RateLimit (+ tests).
+                       #   octocrab stops here.
   components/
     mod.rs
     run_row.rs         # FactoryComponent -> adw::ActionRow (a workflow run)
-    run_detail.rs      # Component -> detail page: jobs + steps, run metadata,
-                       #   embeds the log view
-    log_view.rs        # Component -> embeddable Box; fetched (not streamed) job
-                       #   log text in a fixed-dark "terminal" look
+    run_detail.rs      # Component -> detail page (NavigationPage): run metadata,
+                       #   annotations, jobs + steps; pushes the log page. Stays
+                       #   live while open (the app forwards each poll to it).
+    log_view.rs        # Component -> a job's log page (NavigationPage); fetched
+                       #   (not streamed), whole-job, with collapsible ##[group]
+                       #   sections and ANSI colour, in a fixed-dark "terminal"
     status_chip.rs     # shared WidgetTemplate (pill + dot); Conclusion/RunStatus
                        #   -> label/variant. Reused from Dockyard's design.
     repo_picker.rs     # Component/dialog -> choose the watched repo set
 data/
   dev.miguelrincon.Pitwall.desktop
   icons/hicolor/{16x16,...,512x512,scalable}/apps/dev.miguelrincon.Pitwall.{png,svg}
+  screenshots/           # README gallery (list.png, detail.png)
 Makefile               # make install -> ~/.local (no sudo); make uninstall; make check
 ```
 
@@ -213,17 +217,19 @@ Dependency direction is strictly one-way, as in Dockyard:
 `main -> app -> components/*`, and `app -> github/client -> github/types ->
 [octocrab]`; `components/` never imports `octocrab`.
 
-The root model is roughly (adapt as it's built):
+The root model is roughly (as built — see `src/app.rs` for the full set):
 
 ```rust
 struct AppModel {
     connection: Option<Connection>,      // built octocrab client + verified user/limits
     watched: Vec<Repo>,                  // the hand-picked set (from settings)
-    runs: FactoryVecDeque<RunRow>,       // the *visible* (filtered) runs, newest-first
+    runs: FactoryVecDeque<RunRow>,       // the *visible* (Recent, or search results) runs
     all_runs: Vec<WorkflowRun>,          // full set from the last poll; the filter reads this
-    last_conclusion: HashMap<RunId, Conclusion>, // to detect transitions -> notify
+    last_finished: HashMap<RunId, (Conclusion, DateTime<Utc>)>, // transitions -> notify
+                                         // (the timestamp catches re-runs: same id, later finish)
+    cancelling: HashSet<RunId>,          // client-side "Cancelling" overlay until GitHub finishes
     query: String,                       // search text
-    state: ViewState,                    // Loading | NeedsAuth | AwaitingAuth | Ready | Disconnected(String)
+    state: ViewState,                    // Loading | SignedOut | Ready | Disconnected(String)
     pending: HashMap<RunId, RunAction>,  // re-run / cancel in flight
     refreshing: bool,                    // user-initiated refresh only
     poll: Option<glib::SourceId>,        // None while the window is hidden
@@ -263,28 +269,39 @@ This is Redux with a compiler: actions in, one reducer, view derived from state.
 ## UI shape
 
 - `adw::ApplicationWindow` > `adw::ToolbarView` > `adw::HeaderBar`, opening wide.
-- Header title = `adw::WindowTitle` with a **live subtitle** counting runs, e.g.
-  "12 runs · 2 failing · 1 running". Left: a **search** toggle + `gtk::SearchBar`
-  (Ctrl+F) filtering by repo / workflow / branch, client-side. Right: the
-  **primary menu** (hamburger) — Refresh (Ctrl+R/F5), Edit Watchlist,
-  Preferences (Ctrl+,), Keyboard Shortcuts (Ctrl+?), About, Quit (Ctrl+Q), each a
-  `GAction` posting an `AppMsg`.
-- Main content: `adw::NavigationView`. Root = the run list (clamped, ~700px);
-  clicking a run pushes the **detail** page (jobs → steps + the fetched log).
+- Header title = an `adw::ViewSwitcher` over the **Recent / Repositories** tabs
+  once there are runs (a plain `adw::WindowTitle` otherwise); the failing count
+  rides as a **badge on the Recent tab**. Left: a **search** toggle +
+  `gtk::SearchBar` (Ctrl+F, or type-to-search) filtering by repo / workflow /
+  branch, client-side. Right: the **primary menu** (hamburger) — Refresh
+  (Ctrl+R/F5), Edit Watchlist, Preferences (Ctrl+,), Keyboard Shortcuts (Ctrl+?),
+  About, Quit (Ctrl+Q), each a `GAction` posting an `AppMsg`.
+- Main content: `adw::NavigationView`. Root = an `adw::ViewStack` (clamped,
+  ~700px) with **Recent** (newest `RECENT_CAP` runs) and **Repositories** (one
+  expander per watched repo → its latest run, expanding to that repo's history).
+  A search **takes over the surface**: the tabs hide and one flat list shows all
+  matches across the watchlist. Clicking a run pushes the **detail** page, and a
+  job's "View log" pushes the **log** page on top of that.
 - Each run is an `adw::ActionRow`: title = workflow name (+ run #), subtitle =
   `repo · branch · event · relative time`, a **status chip** prefix (from
-  `Conclusion`/`RunStatus`), and a suffix menu (re-run / re-run failed / cancel /
-  open in browser). Activating the row opens the detail page.
+  `Conclusion`/`RunStatus`), and single-click action buttons — the primary one
+  (re-run when finished / cancel while active, disabled while cancelling) plus
+  open-in-browser. Activating the row opens the detail page.
 - **Status chip** = the shared `StatusChip` `WidgetTemplate` (pill + coloured
   dot): success=green, failure=red, in-progress=blue (subtle pulse), cancelled=
   neutral, queued=amber, skipped=dim. Same widget on the row and the detail page.
-- **Detail** page: run metadata (repo, branch, commit title+sha, actor, event,
-  elapsed), a list of jobs each expandable to its steps (status + duration), and
-  the log panel for a selected completed job.
-- **Log panel**: fixed-dark terminal look (its own `.log-terminal` CSS, theme-
-  independent) — but **fetched, not streamed** (REST has no follow; completed
-  jobs only). Show a spinner while fetching; offer "Open in browser" for a
-  running job whose logs aren't downloadable yet.
+- **Detail** page: run metadata (repo, branch, commit title+sha, author, event,
+  elapsed), an **Annotations** group (warnings / errors / notices from the jobs'
+  check runs, hidden when empty), and a list of jobs each expandable to its steps
+  (status + duration) with a "View log" button. Header carries the same run
+  actions. Stays live while open — the app forwards each poll to it.
+- **Log page**: fixed-dark terminal look (its own `.log-terminal` CSS, theme-
+  independent) — **fetched, not streamed** (REST has no follow; completed jobs
+  only) and **whole-job**, because the raw log has no reliable per-step
+  delimiter. `##[group]` becomes a collapsible section (auto-expanded if it holds
+  an `##[error]`), ANSI colour is parsed into `TextTag`s, and `##[command]` /
+  error / warning lines are coloured. Parse off-thread; spinner while fetching;
+  "Open in browser" for a running job whose logs aren't downloadable yet.
 - **First run / not signed in**: a **blocking onboarding modal** (`adw::Dialog`,
   non-closable) — an app intro + a GitHub-coloured "Sign in with GitHub" button →
   the device-flow user code + browser authorisation; it closes onto the app once
@@ -306,28 +323,44 @@ This is Redux with a compiler: actions in, one reducer, view derived from state.
 - **Adaptive is a later win, not v1.** Poll faster while a run is `in_progress`,
   slower when everything's terminal — but only after the fixed-interval version
   is proven. Same posture as Dockyard's phase-1 poll.
-- **Notifications.** Keep `last_conclusion` per run. When a poll flips a run to
-  `completed` and its `conclusion` matches the user's setting (failures-only /
-  all / off), fire a `gio::Notification` via `Application::send_notification`
-  (native, carries the app icon, clickable to open the run). This is the point of
-  the app — get it working early and keep it reliable.
+- **Notifications.** Keep `last_finished` per run — `(conclusion, updated_at)`,
+  **not** just the conclusion, because a **re-run reuses the run id**: only the
+  timestamp moves, so presence alone would miss it. When a poll shows a run newly
+  finished and its `conclusion` matches the user's setting (failures-only / all /
+  off), fire a `gio::Notification` via `Application::send_notification` (native,
+  app icon, clickable to open the run via the app-scoped `app.open-run` action).
+  The first poll after connecting **seeds the baseline silently**, so old failures
+  don't all alert at startup. This is the point of the app — keep it reliable.
+- **Notifications need the app installed.** GNOME's notification backend drops
+  notifications from an app it can't resolve to an installed `.desktop` + icon.
+  Testing them means `make install` (and a re-login the first time, so GNOME Shell
+  reloads the icon theme) — a `cargo run` build alone will send and show nothing.
 
 ## Scope
 
-**v1 milestones** (Dockyard's issue-driven cadence — one small vertical slice each):
+**v1 shipped in v0.1.0** (Dockyard's issue-driven cadence — one small vertical
+slice, one PR each). All seven milestones are done:
 
-- **M1** — Scaffold + token (keyring) + connect/verify + pick a watch list +
-  list recent runs across it (chip, header count) + poll (ETag + suspend-gate) +
-  errors that name the fix.
-- **M2** — Rows update in place; ETag-per-repo so idle polls are free; rate-limit
-  backoff surfaced in the UI.
-- **M3** — Run detail: jobs + steps, run metadata.
-- **M4** — Logs: fetch a completed job's text into the fixed-dark panel.
-- **M5** — Actions: re-run / re-run-failed / cancel (off-thread, toast on
-  failure, confirm cancel); "open in browser" for the rest.
-- **M6** — Desktop notifications on failure (transition detection), configurable.
-- **M7** — Polish: filters/search, Preferences (interval, notifications, theme),
-  icon + `.desktop` + installer, shortcuts, About.
+- ✅ **M1** — Scaffold + sign-in (device flow → keyring) + connect/verify + pick a
+  watch list + list recent runs across it + poll (suspend-gate) + errors that
+  name the fix.
+- ✅ **M2** — Rows update in place; ETag-per-repo so idle polls are free;
+  rate-limit backoff surfaced in the UI.
+- ✅ **M3** — Run detail: jobs + steps, run metadata.
+- ✅ **M4** — Logs: a completed **job's** text in the fixed-dark panel, with
+  collapsible sections and ANSI colour (per-step proved impossible — see
+  ARCHITECTURE.md).
+- ✅ **M5** — Actions: re-run / re-run-failed / cancel (off-thread, toast on
+  failure, confirm cancel, optimistic feedback); "open in browser" for the rest.
+- ✅ **M6** — Desktop notifications on completion (transition detection),
+  configurable.
+- ✅ **M7** — Polish: search, Preferences (interval, notifications, theme),
+  Recent/Repositories tabs, annotations, icon + `.desktop` + installer,
+  shortcuts, About.
+
+Post-v1, `main` carries a `-dev` version again. The known "later win" still open
+from v1 is **adaptive polling** (faster while a run is active) — the interval is
+user-configurable in the meantime.
 
 **Stay lean — flag the drift, don't gatekeep.** Not the default focus: editing
 workflow files, secrets/variables management, triggering `workflow_dispatch`
