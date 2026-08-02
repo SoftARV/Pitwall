@@ -149,6 +149,10 @@ pub enum RunsOutcome {
     Fresh {
         etag: Option<String>,
         runs: Vec<WorkflowRun>,
+        /// Set when the repo's **current** `full_name` differs from the one we
+        /// queried — i.e. it was renamed on GitHub and our request followed the
+        /// redirect. The caller migrates its watchlist and caches to this name.
+        renamed_to: Option<String>,
     },
     /// 304 Not Modified — nothing changed, and it did **not** cost a request
     /// against the rate limit. This is what makes idle repos free to poll.
@@ -255,13 +259,39 @@ async fn fetch_runs(
             let page = Page::<octocrab::models::workflows::Run>::from_response(response)
                 .await
                 .map_err(|err| diagnose(err).message().to_owned())?;
-            let repo = format!("{owner}/{name}");
+
+            // A renamed repo still answers on its old path (GitHub redirects), so
+            // the only way to notice is the repository block each run carries: if
+            // its `full_name` isn't what we asked for, the repo was renamed. The
+            // comparison is case-insensitive so a differently-cased watchlist
+            // entry doesn't masquerade as a rename.
+            let queried = format!("{owner}/{name}");
+            let current = page
+                .items
+                .first()
+                .and_then(|run| run.repository.full_name.clone())
+                .filter(|full| !full.is_empty());
+            let renamed_to = current
+                .as_deref()
+                .filter(|full| !full.eq_ignore_ascii_case(&queried))
+                .map(str::to_owned);
+            // Label the runs with the repo's real name, so the UI shows where they
+            // came from even on the poll that discovers the rename.
+            let label = current.unwrap_or_else(|| queried.clone());
+
             let runs = page
                 .items
                 .into_iter()
-                .map(|run| WorkflowRun::from_model(run, repo.clone()))
+                .map(|run| WorkflowRun::from_model(run, label.clone()))
                 .collect();
-            Ok((RunsOutcome::Fresh { etag, runs }, rate))
+            Ok((
+                RunsOutcome::Fresh {
+                    etag,
+                    runs,
+                    renamed_to,
+                },
+                rate,
+            ))
         }
         code => Err(format!("GitHub returned HTTP {code} for {owner}/{name}")),
     }

@@ -490,6 +490,12 @@ impl AppModel {
             .collect();
         runs.sort_by_key(|run| std::cmp::Reverse(run.created_at));
 
+        // Belt and braces: one run must appear once. Two watchlist entries can
+        // point at the same repo (an old name still watched after a rename —
+        // GitHub serves both), which would otherwise duplicate every run.
+        let mut seen = HashSet::with_capacity(runs.len());
+        runs.retain(|run| seen.insert(run.id));
+
         // Overlay a client-side "Cancelling" on runs we've asked to cancel, until
         // GitHub actually finishes (they go completed) — then drop them from the
         // set. This gives immediate, lasting feedback while GitHub takes its time
@@ -506,6 +512,29 @@ impl AppModel {
         }
 
         self.all_runs = runs;
+    }
+
+    /// Migrate a watched repo that GitHub reports under a new name.
+    ///
+    /// Renaming a repo doesn't break polling — GitHub redirects the old path — so
+    /// without this the watch list keeps a name that no longer exists: it can't be
+    /// found in the picker to remove, and if the new name is watched too, every
+    /// run arrives twice. Rewrite the entry in place (preserving its position),
+    /// drop the stale caches, persist, and say what happened.
+    fn apply_rename(&mut self, old: &str, new: &str) {
+        if !migrate_watchlist(&mut self.watched, old, new) {
+            // Not watched under the old name (already migrated) — nothing to do.
+            return;
+        }
+        self.settings.watched = self.watched.clone();
+        self.settings.save();
+
+        // The old key's cached runs are the same runs, now stored under `new`.
+        self.runs_by_repo.remove(old);
+        self.etags.remove(old);
+
+        tracing::info!(%old, %new, "watched repo was renamed; watch list migrated");
+        self.toast(&format!("“{old}” was renamed to “{new}”"));
     }
 
     /// After a poll, fire a notification for each run that has *newly* finished
@@ -1080,6 +1109,23 @@ impl AppModel {
             }
         });
     }
+}
+
+/// Replace a renamed repo in the watch list, in place.
+///
+/// Keeps the entry's position (the list's order is the user's), and if the new
+/// name is *already* watched — the case that produced duplicate runs — drops the
+/// stale entry instead of leaving both. Returns whether anything changed.
+fn migrate_watchlist(watched: &mut Vec<String>, old: &str, new: &str) -> bool {
+    let Some(position) = watched.iter().position(|repo| repo == old) else {
+        return false;
+    };
+    if watched.iter().any(|repo| repo == new) {
+        watched.remove(position);
+    } else {
+        watched[position] = new.to_owned();
+    }
+    true
 }
 
 /// A repo expander's subtitle — its latest run at a glance.
@@ -2025,13 +2071,24 @@ impl Component for AppModel {
                 let total = poll.repos.len();
                 let mut failed = 0;
                 let mut last_error = String::new();
+                let mut renames: Vec<(String, String)> = Vec::new();
                 for RepoRuns { repo, outcome } in poll.repos {
                     match outcome {
-                        RunsOutcome::Fresh { etag, runs } => {
-                            if let Some(etag) = etag {
-                                self.etags.insert(repo.clone(), etag);
+                        RunsOutcome::Fresh {
+                            etag,
+                            runs,
+                            renamed_to,
+                        } => {
+                            // A renamed repo's data belongs under its new name, so
+                            // cache it there; the watchlist migration follows below.
+                            let key = renamed_to.clone().unwrap_or_else(|| repo.clone());
+                            if let Some(new_name) = renamed_to {
+                                renames.push((repo.clone(), new_name));
                             }
-                            self.runs_by_repo.insert(repo, runs);
+                            if let Some(etag) = etag {
+                                self.etags.insert(key.clone(), etag);
+                            }
+                            self.runs_by_repo.insert(key, runs);
                         }
                         // 304: keep the cached runs and ETag untouched.
                         RunsOutcome::NotModified => {}
@@ -2053,6 +2110,12 @@ impl Component for AppModel {
                         self.state = ViewState::Disconnected(last_error);
                     }
                     return;
+                }
+
+                // Migrate any repo GitHub told us was renamed, before the rebuild
+                // reads the watch list.
+                for (old, new) in renames {
+                    self.apply_rename(&old, &new);
                 }
 
                 self.rebuild_runs();
@@ -2085,5 +2148,42 @@ impl Component for AppModel {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rename_replaces_the_entry_in_place() {
+        let mut watched = vec![
+            "owner/first".to_owned(),
+            "owner/old".to_owned(),
+            "owner/last".to_owned(),
+        ];
+        assert!(migrate_watchlist(&mut watched, "owner/old", "owner/new"));
+        // Renamed in place — the user's ordering is preserved.
+        assert_eq!(watched, ["owner/first", "owner/new", "owner/last"]);
+    }
+
+    #[test]
+    fn rename_drops_the_stale_entry_when_both_are_watched() {
+        // The bug's end state: the old name never left the list and the new one
+        // was added by hand, so every run arrived twice.
+        let mut watched = vec![
+            "owner/old".to_owned(),
+            "owner/new".to_owned(),
+            "owner/other".to_owned(),
+        ];
+        assert!(migrate_watchlist(&mut watched, "owner/old", "owner/new"));
+        assert_eq!(watched, ["owner/new", "owner/other"]);
+    }
+
+    #[test]
+    fn rename_is_a_no_op_once_migrated() {
+        let mut watched = vec!["owner/new".to_owned()];
+        assert!(!migrate_watchlist(&mut watched, "owner/old", "owner/new"));
+        assert_eq!(watched, ["owner/new"]);
     }
 }
