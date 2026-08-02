@@ -84,12 +84,15 @@ impl RepoPicker {
         while let Some(child) = self.list_box.first_child() {
             self.list_box.remove(&child);
         }
-        for repo in repos {
-            let full_name = repo.full_name();
+
+        let add_row = |full_name: String, subtitle: &str, orphan: bool| {
             let row = adw::SwitchRow::new();
             row.set_title(&full_name);
-            row.set_subtitle(if repo.private { "Private" } else { "Public" });
+            row.set_subtitle(subtitle);
             row.set_active(self.selected.contains(&full_name));
+            if orphan {
+                row.add_css_class("warning");
+            }
 
             let input = sender.input_sender().clone();
             row.connect_active_notify(move |row| {
@@ -98,6 +101,33 @@ impl RepoPicker {
                     .ok();
             });
             self.list_box.append(&row);
+        };
+
+        // Anything watched that GitHub didn't list back — renamed, deleted, or no
+        // longer accessible. Without a row there'd be no way to untick it, and it
+        // would be re-saved (still selected) every time. Listed first, since it's
+        // the thing most likely to need attention.
+        let listed: HashSet<String> = repos.iter().map(Repo::full_name).collect();
+        let mut orphans: Vec<&String> = self
+            .selected
+            .iter()
+            .filter(|name| !listed.contains(*name))
+            .collect();
+        orphans.sort();
+        for name in orphans {
+            add_row(
+                name.clone(),
+                "Not found — renamed, deleted, or no longer accessible",
+                true,
+            );
+        }
+
+        for repo in repos {
+            add_row(
+                repo.full_name(),
+                if repo.private { "Private" } else { "Public" },
+                false,
+            );
         }
     }
 }
